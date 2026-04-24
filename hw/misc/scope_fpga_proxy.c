@@ -273,7 +273,7 @@ static void scope_log_guest_translation(const char *tag, const ScopeSqState *sq,
                                         uint64_t bar_offset, uint64_t translated_pa)
 {
     printf("[SCOPE PROXY][CMD][%s][ADDR] qid=%u slot=%u guest_pa=0x%016" PRIx64
-           " len=%zu bar_offset=0x%016" PRIx64 " translated=0x%016" PRIx64 "\n",
+           " len=%zu bar_offset=0x%016" PRIx64 " host_bypass=0x%016" PRIx64 "\n",
            tag,
            sq ? sq->qid : 0U,
            slot,
@@ -744,18 +744,39 @@ static bool scope_guest_range_to_bar_offset(ScopeProxyState *s, uint64_t guest_p
     return true;
 }
 
-static bool scope_translate_guest_pa(ScopeProxyState *s, uint64_t guest_pa, size_t len,
-                                     uint64_t *translated_pa)
+static bool scope_translate_guest_pa_for_host_bypass(ScopeProxyState *s, uint64_t guest_pa,
+                                                     size_t len, uint64_t *translated_pa)
 {
     uint64_t bar_offset;
 
     if (!scope_guest_range_to_bar_offset(s, guest_pa, len, &bar_offset)) {
-        printf("[SCOPE PROXY][DDR][XLATE][ERR] guest_pa=0x%016" PRIx64
+        printf("[SCOPE PROXY][DDR][HOST_XLATE][ERR] guest_pa=0x%016" PRIx64
                " len=%zu translation failed\n", guest_pa, len);
         fflush(stdout);
         return false;
     }
 
+    *translated_pa = s->fpga_bypass_bar_base + bar_offset;
+    return true;
+}
+
+static bool scope_translate_guest_pa_for_real_dma(ScopeProxyState *s, uint64_t guest_pa,
+                                                  size_t len, uint64_t *translated_pa)
+{
+    uint64_t bar_offset;
+
+    /*
+     * The real NVMe is controlled from the x86 host side, so its DMA reaches
+     * role DDR through PCIe P2P into the FPGA XDMA EP bypass BAR.  Therefore
+     * the real device must see the host-assigned bypass BAR address, while
+     * QEMU still uses the BAR offset for /dev/xdma0_bypass mmap access.
+     */
+    if (!scope_guest_range_to_bar_offset(s, guest_pa, len, &bar_offset)) {
+        printf("[SCOPE PROXY][DDR][DMA_XLATE][ERR] guest_pa=0x%016" PRIx64
+               " len=%zu translation failed\n", guest_pa, len);
+        fflush(stdout);
+        return false;
+    }
     *translated_pa = s->fpga_bypass_bar_base + bar_offset;
     return true;
 }
@@ -982,8 +1003,8 @@ static bool scope_refresh_admin_queue_state(ScopeProxyState *s)
     if (!s->guest_asq || !s->guest_acq || !sq_depth || !cq_depth) {
         return true;
     }
-    if (!scope_translate_guest_pa(s, s->guest_asq, 1, &translated_asq) ||
-        !scope_translate_guest_pa(s, s->guest_acq, 1, &translated_acq)) {
+    if (!scope_translate_guest_pa_for_real_dma(s, s->guest_asq, 1, &translated_asq) ||
+        !scope_translate_guest_pa_for_real_dma(s, s->guest_acq, 1, &translated_acq)) {
         return false;
     }
 
@@ -1012,14 +1033,21 @@ static bool scope_sync_admin_regs_to_real(ScopeProxyState *s)
 {
     uint64_t translated_asq = 0;
     uint64_t translated_acq = 0;
+    uint64_t host_bypass = 0;
 
     if (!scope_real_bar_write32(s, NVME_REG_AQA, s->guest_aqa)) {
         return false;
     }
 
     if (s->guest_asq) {
-        if (!scope_translate_guest_pa(s, s->guest_asq, 1, &translated_asq)) {
+        if (!scope_translate_guest_pa_for_real_dma(s, s->guest_asq, 1, &translated_asq)) {
             return false;
+        }
+        if (scope_translate_guest_pa_for_host_bypass(s, s->guest_asq, 1, &host_bypass)) {
+            printf("[SCOPE PROXY][ADMIN][XLATE] ASQ guest=0x%016" PRIx64
+                   " real_dma=0x%016" PRIx64 " host_bypass=0x%016" PRIx64 "\n",
+                   s->guest_asq, translated_asq, host_bypass);
+            fflush(stdout);
         }
         if (!scope_real_bar_write32(s, NVME_REG_ASQ, (uint32_t)translated_asq) ||
             !scope_real_bar_write32(s, NVME_REG_ASQ + 4,
@@ -1029,8 +1057,14 @@ static bool scope_sync_admin_regs_to_real(ScopeProxyState *s)
     }
 
     if (s->guest_acq) {
-        if (!scope_translate_guest_pa(s, s->guest_acq, 1, &translated_acq)) {
+        if (!scope_translate_guest_pa_for_real_dma(s, s->guest_acq, 1, &translated_acq)) {
             return false;
+        }
+        if (scope_translate_guest_pa_for_host_bypass(s, s->guest_acq, 1, &host_bypass)) {
+            printf("[SCOPE PROXY][ADMIN][XLATE] ACQ guest=0x%016" PRIx64
+                   " real_dma=0x%016" PRIx64 " host_bypass=0x%016" PRIx64 "\n",
+                   s->guest_acq, translated_acq, host_bypass);
+            fflush(stdout);
         }
         if (!scope_real_bar_write32(s, NVME_REG_ACQ, (uint32_t)translated_acq) ||
             !scope_real_bar_write32(s, NVME_REG_ACQ + 4,
@@ -1050,7 +1084,7 @@ static bool scope_register_cq(ScopeProxyState *s, uint16_t qid, uint64_t guest_b
     if (!qid || qid >= SCOPE_MAX_NVME_QUEUES || !depth) {
         return false;
     }
-    if (!scope_translate_guest_pa(s, guest_base, 1, &translated)) {
+    if (!scope_translate_guest_pa_for_real_dma(s, guest_base, 1, &translated)) {
         return false;
     }
 
@@ -1074,7 +1108,7 @@ static bool scope_register_sq(ScopeProxyState *s, uint16_t qid, uint16_t cqid,
     if (!qid || qid >= SCOPE_MAX_NVME_QUEUES || !depth) {
         return false;
     }
-    if (!scope_translate_guest_pa(s, guest_base, 1, &translated)) {
+    if (!scope_translate_guest_pa_for_real_dma(s, guest_base, 1, &translated)) {
         return false;
     }
 
@@ -1094,7 +1128,7 @@ static bool scope_patch_common_command_buffers(ScopeProxyState *s, NvmeCmd *cmd)
     uint8_t psdt = NVME_CMD_FLAGS_PSDT(cmd->flags);
 
     if (cmd->mptr) {
-        if (!scope_translate_guest_pa(s, cmd->mptr, 1, &translated)) {
+        if (!scope_translate_guest_pa_for_real_dma(s, cmd->mptr, 1, &translated)) {
             printf("[SCOPE PROXY][CMD][PATCH][ERR] opcode=0x%02x cid=%u mptr=0x%016"
                    PRIx64 " translation failed\n",
                    cmd->opcode, le16_to_cpu(cmd->cid), le64_to_cpu(cmd->mptr));
@@ -1116,7 +1150,7 @@ static bool scope_patch_common_command_buffers(ScopeProxyState *s, NvmeCmd *cmd)
     }
 
     if (cmd->dptr.prp1) {
-        if (!scope_translate_guest_pa(s, cmd->dptr.prp1, 1, &translated)) {
+        if (!scope_translate_guest_pa_for_real_dma(s, cmd->dptr.prp1, 1, &translated)) {
             printf("[SCOPE PROXY][CMD][PATCH][ERR] opcode=0x%02x cid=%u prp1=0x%016"
                    PRIx64 " translation failed\n",
                    cmd->opcode, le16_to_cpu(cmd->cid), le64_to_cpu(cmd->dptr.prp1));
@@ -1126,7 +1160,7 @@ static bool scope_patch_common_command_buffers(ScopeProxyState *s, NvmeCmd *cmd)
         cmd->dptr.prp1 = translated;
     }
     if (cmd->dptr.prp2) {
-        if (!scope_translate_guest_pa(s, cmd->dptr.prp2, 1, &translated)) {
+        if (!scope_translate_guest_pa_for_real_dma(s, cmd->dptr.prp2, 1, &translated)) {
             printf("[SCOPE PROXY][CMD][PATCH][ERR] opcode=0x%02x cid=%u prp2=0x%016"
                    PRIx64 " translation failed\n",
                    cmd->opcode, le16_to_cpu(cmd->cid), le64_to_cpu(cmd->dptr.prp2));
@@ -1218,7 +1252,7 @@ static bool scope_patch_admin_cmd(ScopeProxyState *s, NvmeCmd *cmd,
         uint64_t guest_base = cq->prp1;
         uint64_t translated = 0;
 
-        if (!scope_translate_guest_pa(s, guest_base, 1, &translated)) {
+        if (!scope_translate_guest_pa_for_real_dma(s, guest_base, 1, &translated)) {
             printf("[SCOPE PROXY][CMD][ADMIN][ERR] CREATE_CQ cid=%u cqid=%u qsize=%u "
                    "guest_base=0x%016" PRIx64 " translation failed\n",
                    le16_to_cpu(cq->cid), le16_to_cpu(cq->cqid), le16_to_cpu(cq->qsize) + 1U,
@@ -1240,7 +1274,7 @@ static bool scope_patch_admin_cmd(ScopeProxyState *s, NvmeCmd *cmd,
         uint64_t guest_base = sq->prp1;
         uint64_t translated = 0;
 
-        if (!scope_translate_guest_pa(s, guest_base, 1, &translated)) {
+        if (!scope_translate_guest_pa_for_real_dma(s, guest_base, 1, &translated)) {
             printf("[SCOPE PROXY][CMD][ADMIN][ERR] CREATE_SQ cid=%u sqid=%u cqid=%u "
                    "qsize=%u guest_base=0x%016" PRIx64 " translation failed\n",
                    le16_to_cpu(sq->cid), le16_to_cpu(sq->sqid), le16_to_cpu(sq->cqid),
@@ -1338,9 +1372,10 @@ static bool scope_process_new_sq_entries(ScopeProxyState *s, ScopeSqState *sq,
 
         if (sq->qid == SCOPE_ADMIN_QID) {
             have_translation =
-                scope_guest_range_to_bar_offset(s, cmd_guest_pa, sizeof(cmd), &cmd_bar_offset);
+                scope_guest_range_to_bar_offset(s, cmd_guest_pa, sizeof(cmd), &cmd_bar_offset) &&
+                scope_translate_guest_pa_for_host_bypass(s, cmd_guest_pa, sizeof(cmd),
+                                                         &cmd_translated_pa);
             if (have_translation) {
-                cmd_translated_pa = s->fpga_bypass_bar_base + cmd_bar_offset;
                 scope_log_guest_translation("RAW", sq, cursor, cmd_guest_pa,
                                             sizeof(cmd), cmd_bar_offset, cmd_translated_pa);
             }
@@ -1357,6 +1392,10 @@ static bool scope_process_new_sq_entries(ScopeProxyState *s, ScopeSqState *sq,
             scope_log_nvme_cmd_dwords("PATCH_ERR", sq, cursor, cmd_guest_pa, &cmd);
             scope_log_nvme_cmd_hexdump("PATCH_ERR", sq, cursor, cmd_guest_pa, &cmd);
             return false;
+        }
+        if (sq->qid == SCOPE_ADMIN_QID) {
+            scope_log_nvme_cmd("PATCHED", sq, cursor, cmd_guest_pa, &cmd);
+            scope_log_nvme_cmd_dwords("PATCHED", sq, cursor, cmd_guest_pa, &cmd);
         }
 
         if (!scope_guest_mem_write(s, cmd_guest_pa, &cmd, sizeof(cmd))) {
@@ -1378,7 +1417,7 @@ static bool scope_process_new_sq_entries(ScopeProxyState *s, ScopeSqState *sq,
                                            &cmd_visible);
             } else if (have_translation) {
                 printf("[SCOPE PROXY][CMD][VISIBLE_AFTER_WRITEBACK][OK] qid=%u slot=%u "
-                       "guest_pa=0x%016" PRIx64 " translated=0x%016" PRIx64 "\n",
+                       "guest_pa=0x%016" PRIx64 " host_bypass=0x%016" PRIx64 "\n",
                        sq->qid, cursor, cmd_guest_pa, cmd_translated_pa);
                 fflush(stdout);
             }
@@ -1800,15 +1839,34 @@ static void scope_process_bar_packet(ScopeProxyState *s, const struct scope_dma3
     uint64_t lane_data = ((uint64_t)pkt->guest_addr_lo << 32) | pkt->data;
 
     switch (pkt->type) {
-    case SCOPE_PKT_TYPE_BAR_WRITE:
+    case SCOPE_PKT_TYPE_BAR_WRITE: {
+        bool is_sq = false;
+        uint16_t qid = 0;
+        uint32_t aligned_offset = pkt->bar_offset & ~0x3U;
+        bool is_doorbell = scope_is_doorbell_offset(s, aligned_offset, &is_sq, &qid);
+        bool early_resp = is_doorbell &&
+                          is_sq &&
+                          size_bytes == 4 &&
+                          scope_extract_wstrb4(wstrb, pkt->bar_offset) == 0x0f;
+
+        if (early_resp &&
+            !scope_write_bar_response(s, pkt->seq, 0, 0, false)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SCOPE: Failed to write early BAR doorbell response\n");
+        }
+
         ok = scope_handle_nvme_bar_write(s, pkt->bar_offset, lane_data, wstrb, size_bytes);
         resp = ok ? 0x0U : 0x2U;
         scope_log_bar_write(s, pkt->seq, pkt->bar_offset, pkt->flags, size_bytes, wstrb,
                             lane_data, ok);
-        if (!scope_write_bar_response(s, pkt->seq, resp, 0, false)) {
+        if (!early_resp && !scope_write_bar_response(s, pkt->seq, resp, 0, false)) {
             qemu_log_mask(LOG_GUEST_ERROR, "SCOPE: Failed to write BAR write response\n");
+        } else if (early_resp && !ok) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SCOPE: Doorbell processing failed after early BAR response\n");
         }
         break;
+    }
     case SCOPE_PKT_TYPE_BAR_READ:
         ok = scope_handle_nvme_bar_read(s, pkt->bar_offset, size_bytes, &data);
         resp = ok ? 0x0U : 0x2U;
@@ -1958,7 +2016,9 @@ static void *scope_proxy_rx_thread(void *opaque)
     uint32_t last_seq_by_type[4] = { 0 };
 
     while (!qatomic_read(&s->rx_thread_stop)) {
-        bool progressed = scope_poll_dma32_ring(s, last_seq_by_type);
+        bool progressed = false;
+
+        progressed = scope_poll_dma32_ring(s, last_seq_by_type) || progressed;
 
         scope_update_virtual_intx(s);
 
