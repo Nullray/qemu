@@ -29,6 +29,8 @@ struct scope_dma32_packet {
     /*
      * CFG_WRITE keeps using this last dword as compact metadata.
      * BAR packets reuse it as the upper 32 bits of the 64-bit data lane.
+     * SQE_WRITE_DONE uses bar_offset as guest_pa[31:0], data as write bytes,
+     * and guest_addr_lo as guest_pa[63:32].
      */
     uint32_t guest_addr_lo;
 };
@@ -36,5 +38,7 @@ struct scope_dma32_packet {
 #define SCOPE_PKT_TYPE_CFG_WRITE 1U
 #define SCOPE_PKT_TYPE_BAR_WRITE 2U
 #define SCOPE_PKT_TYPE_BAR_READ  3U
+#define SCOPE_PKT_TYPE_BAR_WRITE_DONE 4U
+#define SCOPE_PKT_TYPE_SQE_WRITE_DONE 5U
 
 #endif
