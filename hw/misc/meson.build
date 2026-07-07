@@ -169,3 +169,4 @@ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
 # Proxy devices
 system_ss.add(when: 'CONFIG_PCI', if_true: files('scope_fpga_proxy.c'))
+system_ss.add(when: 'CONFIG_PCI', if_true: files('scope_fpga_mmio_lat_test.c'))
