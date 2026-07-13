@@ -25,4 +25,17 @@
      (((uint32_t)(bar) & 0x7U) << 16) | \
      ((uint32_t)(bdf) & 0xffffU))
 
+/* SQE_WRITE_DONE uses the legacy monitor layout plus a backend selector. */
+#define SCOPE_VSWITCH_SQE_SLOT(flags)       ((uint16_t)((flags) & 0xffffU))
+#define SCOPE_VSWITCH_SQE_QID(flags)        ((uint8_t)(((flags) >> 16) & 0xffU))
+#define SCOPE_VSWITCH_SQE_BRESP(flags)      ((uint8_t)(((flags) >> 24) & 0x3U))
+#define SCOPE_VSWITCH_SQE_BACKEND(flags)    ((uint8_t)(((flags) >> 26) & 0xfU))
+#define SCOPE_VSWITCH_SQE_OVERFLOW(flags)   (((flags) & (1U << 31)) != 0)
+#define SCOPE_VSWITCH_MAKE_SQE_FLAGS(slot, qid, bresp, backend, overflow) \
+    (((overflow) ? (1U << 31) : 0U) | \
+     (((uint32_t)(backend) & 0xfU) << 26) | \
+     (((uint32_t)(bresp) & 0x3U) << 24) | \
+     (((uint32_t)(qid) & 0xffU) << 16) | \
+     ((uint32_t)(slot) & 0xffffU))
+
 #endif
