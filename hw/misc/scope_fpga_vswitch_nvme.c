@@ -21,15 +21,10 @@
 OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 
 #define HOST_MBX_BASE           0x01000000U
-#define SQE_MON_CFG_BASE        0x01001000U
 #define HOST_ECAM_SHADOW_BASE   0x01010000U
 #define HOST_ECAM_SHADOW_SIZE   0x00020000U
 
 #define MBX_REG_ACK               0x10U
-#define MBX_REG_GUEST_BAR0_LO     0x20U
-#define MBX_REG_GUEST_BAR0_HI     0x24U
-#define MBX_REG_GUEST_BAR0_SIZE   0x28U
-#define MBX_REG_GUEST_BAR0_CTRL   0x2CU
 #define MBX_REG_PROXY_CTRL        0x30U
 #define MBX_REG_BAR_RESP_DATA_LO  0x34U
 #define MBX_REG_BAR_RESP_SEQ      0x38U
@@ -39,23 +34,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 #define MBX_REG_RP_INTX_STATUS    0x54U
 #define MBX_REG_RP_INTX_COUNT     0x58U
 
-#define MON_REG_ADMIN_SQ_BASE_LO  0x00U
-#define MON_REG_ADMIN_SQ_BASE_HI  0x04U
-#define MON_REG_ADMIN_SQ_BYTES    0x08U
-#define MON_REG_ADMIN_SQ_CTRL     0x0CU
-#define MON_REG_STATUS            0x3F0U
-#define MON_BACKEND_STRIDE        0x20U
-
-#define GUEST_BAR0_CTRL_VALID      (1U << 0)
-#define GUEST_BAR0_CTRL_MEM_ENABLE (1U << 1)
-#define GUEST_BAR0_CTRL_IS64       (1U << 2)
-#define GUEST_BAR0_CTRL_BACKEND_SHIFT 8U
+#define ROUTE_CTRL_VALID           (1U << 0)
+#define ROUTE_CTRL_MEM_ENABLE      (1U << 1)
+#define ROUTE_CTRL_IS64            (1U << 2)
+#define ROUTE_CTRL_BACKEND_SHIFT   8U
 #define PROXY_CTRL_BAR_ROUTE_READY   (1U << 0)
 #define PROXY_CTRL_ECAM_SHADOW_READY (1U << 1)
 #define BAR_RESP_CTRL_TOGGLE_SHIFT 2
 #define BAR_RESP_CTRL_DONE_SHIFT   3
-#define MON_ADMIN_SQ_CTRL_VALID    (1U << 0)
-#define MON_STATUS_OVERFLOW        (1U << 0)
 
 #define IORESOURCE_MEM               0x00000200ULL
 #define SCOPE_RP_BAR_APERTURE_SIZE   0x00100000U
@@ -65,17 +51,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 #define SCOPE_MAX_NVME_QUEUES        256U
 #define SCOPE_ADMIN_QID              0U
 #define SCOPE_ADMIN_CID_SPACE        (UINT16_MAX + 1U)
-#define SCOPE_ADMIN_SQ_MAX_TRACKED   4096U
-#define SCOPE_DMA32_TYPE_MAX         SCOPE_PKT_TYPE_SQE_WRITE_DONE
+#define SCOPE_DMA32_TYPE_MAX         SCOPE_PKT_TYPE_BAR_WRITE_DONE
 #define SCOPE_NVME_DOORBELL_BASE     0x1000U
 #define SCOPE_INTX_RETRY_INTERVAL_US 500000U
 #define SCOPE_INTX_RETRY_LOW_US      20U
-#define SCOPE_DEBUG_ADMIN_SQE_DONE_TIMEOUT_FALLBACK 1
-#define SCOPE_ADMIN_SQE_DONE_FALLBACK_US 5000U
-#define SCOPE_ADMIN_SQE_DONE_FALLBACK_RETRY_US 500000U
 #define SCOPE_ADMIN_SQE_VISIBILITY_RETRY_US 100U
 #define SCOPE_BAR_DONE_TIMEOUT_US       5000U
-#define SCOPE_ADMIN_SQE_DONE_FULL_MASK UINT64_MAX
 #define SCOPE_DEBUG_IO_PRP_TRACE 0
 #define SCOPE_NVME_DEFAULT_CTRL_PAGE_SIZE 4096U
 #define SCOPE_NVME_MIN_LBA_SHIFT 9U
@@ -241,10 +222,7 @@ typedef struct ScopePendingDoorbell {
     uint16_t qid;
     uint16_t new_tail;
     int64_t pending_since_us;
-    int64_t fallback_next_try_us;
-    uint64_t fallback_try_count;
-    bool slot_baseline_valid[SCOPE_ADMIN_SQ_MAX_TRACKED];
-    uint32_t slot_baseline_seq[SCOPE_ADMIN_SQ_MAX_TRACKED];
+    int64_t next_visibility_retry_us;
 } ScopePendingDoorbell;
 
 typedef struct ScopeNvmeBackend {
@@ -277,11 +255,6 @@ typedef struct ScopeNvmeBackend {
     uint32_t inferred_bar_done_seq;
     uint32_t inferred_bar_done_offset;
     uint64_t inferred_bar_done_count;
-    bool admin_sq_slot_done_valid[SCOPE_ADMIN_SQ_MAX_TRACKED];
-    uint32_t admin_sq_slot_done_seq[SCOPE_ADMIN_SQ_MAX_TRACKED];
-    uint64_t admin_sq_slot_done_mask[SCOPE_ADMIN_SQ_MAX_TRACKED];
-    uint32_t admin_sq_slot_consumed_seq[SCOPE_ADMIN_SQ_MAX_TRACKED];
-    bool admin_sq_slot_fallback_wait_done[SCOPE_ADMIN_SQ_MAX_TRACKED];
     bool intx_pending;
 } ScopeNvmeBackend;
 
@@ -317,7 +290,6 @@ struct ScopeProxyState {
     uint64_t fpga_bypass_bar_size;
     uint64_t bypass_coherent_alias_base;
     bool guest_mem_raw_fallback;
-    bool sqe_monitor_enable;
     int fpga_bypass_bar_index;
     uint32_t proxy_ctrl_shadow;
     ScopeVswitchConfigFn vcfg[SCOPE_VSWITCH_ECAM_FUNC_COUNT];
@@ -817,38 +789,6 @@ static bool scope_admin_cmd_looks_plausible(const NvmeCmd *cmd)
     }
 }
 
-static uint64_t scope_admin_sqe_done_mask_for_packet(uint64_t guest_pa,
-                                                     uint32_t bytes,
-                                                     uint64_t slot_base)
-{
-    uint64_t write_start = guest_pa;
-    uint64_t write_end = guest_pa + bytes;
-    uint64_t slot_end = slot_base + sizeof(NvmeCmd);
-    uint64_t cover_start;
-    uint64_t cover_end;
-    uint64_t cover_len;
-    unsigned shift;
-
-    if (!bytes || write_end <= write_start ||
-        write_start >= slot_end || write_end <= slot_base) {
-        return 0;
-    }
-
-    cover_start = write_start < slot_base ? slot_base : write_start;
-    cover_end = write_end > slot_end ? slot_end : write_end;
-    if (cover_end <= cover_start) {
-        return 0;
-    }
-
-    shift = (unsigned)(cover_start - slot_base);
-    cover_len = cover_end - cover_start;
-    if (cover_len >= sizeof(NvmeCmd)) {
-        return SCOPE_ADMIN_SQE_DONE_FULL_MASK;
-    }
-
-    return ((UINT64_C(1) << (unsigned)cover_len) - 1U) << shift;
-}
-
 static inline uint32_t scope_apply_wstrb32(uint32_t current, uint32_t data, uint8_t wstrb)
 {
     uint32_t next = current;
@@ -1115,49 +1055,6 @@ static bool scope_ack_cfg_packet(ScopeProxyState *s, uint32_t seq)
     return ok;
 }
 
-static bool scope_sync_admin_window_to_fpga(ScopeProxyState *s, bool valid)
-{
-    uint64_t sq_base = 0;
-    uint32_t sq_bytes = 0;
-    uint32_t ctrl = 0;
-    bool ok = true;
-    uint32_t cfg_base = SQE_MON_CFG_BASE + s->active->id * MON_BACKEND_STRIDE;
-
-    if (s->sqe_monitor_enable && valid &&
-        s->active->sq[SCOPE_ADMIN_QID].valid &&
-        s->active->sq[SCOPE_ADMIN_QID].depth) {
-        sq_base = s->active->sq[SCOPE_ADMIN_QID].guest_base;
-        sq_bytes = (uint32_t)s->active->sq[SCOPE_ADMIN_QID].depth * sizeof(NvmeCmd);
-        ctrl |= MON_ADMIN_SQ_CTRL_VALID;
-    }
-
-    if (s->xdma_fd < 0) {
-        return true;
-    }
-
-    qemu_mutex_lock(&s->xdma_lock);
-    ok = scope_xdma_write32_locked(s, cfg_base + MON_REG_ADMIN_SQ_CTRL,
-                                   0);
-    ok = ok && scope_xdma_write32_locked(s, cfg_base + MON_REG_ADMIN_SQ_BASE_LO,
-                                         (uint32_t)sq_base);
-    ok = ok && scope_xdma_write32_locked(s, cfg_base + MON_REG_ADMIN_SQ_BASE_HI,
-                                         (uint32_t)(sq_base >> 32));
-    ok = ok && scope_xdma_write32_locked(s, cfg_base + MON_REG_ADMIN_SQ_BYTES,
-                                         sq_bytes);
-    ok = ok && scope_xdma_write32_locked(s, cfg_base + MON_REG_ADMIN_SQ_CTRL,
-                                         ctrl);
-    qemu_mutex_unlock(&s->xdma_lock);
-
-    SCOPE_PRINTF("[SCOPE PROXY][SQE_MON][CFG] enabled=%d backend=%u virtual=%02x:00.0 "
-           "valid=%d sq=0x%016" PRIx64
-           " sq_bytes=%u ctrl=0x%08x result=%s\n",
-           s->sqe_monitor_enable, s->active->id, 3U + s->active->id,
-           (ctrl & MON_ADMIN_SQ_CTRL_VALID) != 0, sq_base, sq_bytes,
-           ctrl, ok ? "OK" : "ERR");
-    SCOPE_FFLUSH(stdout);
-    return ok;
-}
-
 static int scope_vcfg_index_from_bdf(uint16_t bdf)
 {
     unsigned int i;
@@ -1409,29 +1306,29 @@ static bool scope_sync_guest_bar_shadow(ScopeProxyState *s,
                 ((bar0_lo & PCI_BASE_ADDRESS_MEM_TYPE_MASK) == PCI_BASE_ADDRESS_MEM_TYPE_64);
     uint64_t base = is_mem ?
         (((uint64_t)bar0_hi << 32) | (uint64_t)(bar0_lo & PCI_BASE_ADDRESS_MEM_MASK)) : 0;
-    uint32_t ctrl = (uint32_t)be->id << GUEST_BAR0_CTRL_BACKEND_SHIFT;
+    uint32_t ctrl = (uint32_t)be->id << ROUTE_CTRL_BACKEND_SHIFT;
     uint32_t route = HOST_MBX_BASE + SCOPE_ROUTE_BASE + be->id * SCOPE_ROUTE_STRIDE;
     bool ok;
 
     if (is_mem && base != 0 && base != UINT64_MAX) {
-        ctrl |= GUEST_BAR0_CTRL_VALID;
+        ctrl |= ROUTE_CTRL_VALID;
     }
     if (command & PCI_COMMAND_MEMORY) {
-        ctrl |= GUEST_BAR0_CTRL_MEM_ENABLE;
+        ctrl |= ROUTE_CTRL_MEM_ENABLE;
     }
     if (is64) {
-        ctrl |= GUEST_BAR0_CTRL_IS64;
+        ctrl |= ROUTE_CTRL_IS64;
     }
-    if ((ctrl & GUEST_BAR0_CTRL_VALID) &&
+    if ((ctrl & ROUTE_CTRL_VALID) &&
         (be->real_bar0_size == 0 ||
          base < SCOPE_GUEST_MMIO_BASE ||
          base > SCOPE_GUEST_MMIO_BASE + SCOPE_GUEST_MMIO_SIZE - be->real_bar0_size)) {
         SCOPE_PRINTF("[SCOPE VSWITCH][ROUTE][INVALID] backend=%u base=0x%016" PRIx64
                      " size=0x%zx outside PCI MEM window\n",
                      be->id, base, be->real_bar0_size);
-        ctrl &= ~GUEST_BAR0_CTRL_VALID;
+        ctrl &= ~ROUTE_CTRL_VALID;
     }
-    if (ctrl & GUEST_BAR0_CTRL_VALID) {
+    if (ctrl & ROUTE_CTRL_VALID) {
         unsigned int i;
         for (i = 0; i < s->backend_count; i++) {
             ScopeVswitchConfigFn *other;
@@ -1448,7 +1345,7 @@ static bool scope_sync_guest_bar_shadow(ScopeProxyState *s,
                 other_base < base + be->real_bar0_size) {
                 SCOPE_PRINTF("[SCOPE VSWITCH][ROUTE][COLLISION] backend=%u overlaps %u\n",
                              be->id, i);
-                ctrl &= ~GUEST_BAR0_CTRL_VALID;
+                ctrl &= ~ROUTE_CTRL_VALID;
                 break;
             }
         }
@@ -1467,9 +1364,6 @@ static bool scope_sync_guest_bar_shadow(ScopeProxyState *s,
 
     if (!ok && errp) {
         error_setg(errp, "Failed to sync guest BAR0 shadow registers");
-        return false;
-    }
-    if (!scope_set_proxy_ctrl_bits(s, PROXY_CTRL_BAR_ROUTE_READY, errp)) {
         return false;
     }
     if (ok) {
@@ -1770,12 +1664,6 @@ static void scope_reset_all_queue_state(ScopeProxyState *s)
     memset(s->active->admin_cid_outstanding, 0, sizeof(s->active->admin_cid_outstanding));
     s->active->admin_outstanding_count = 0;
     memset(&s->active->pending_sq_db, 0, sizeof(s->active->pending_sq_db));
-    memset(s->active->admin_sq_slot_done_valid, 0, sizeof(s->active->admin_sq_slot_done_valid));
-    memset(s->active->admin_sq_slot_done_seq, 0, sizeof(s->active->admin_sq_slot_done_seq));
-    memset(s->active->admin_sq_slot_done_mask, 0, sizeof(s->active->admin_sq_slot_done_mask));
-    memset(s->active->admin_sq_slot_consumed_seq, 0, sizeof(s->active->admin_sq_slot_consumed_seq));
-    memset(s->active->admin_sq_slot_fallback_wait_done, 0,
-           sizeof(s->active->admin_sq_slot_fallback_wait_done));
     s->active->intx_pending = false;
 }
 
@@ -2263,7 +2151,7 @@ static bool scope_refresh_admin_queue_state(ScopeProxyState *s)
     memset(&s->active->cq[SCOPE_ADMIN_QID], 0, sizeof(s->active->cq[SCOPE_ADMIN_QID]));
 
     if (!s->active->guest_asq || !s->active->guest_acq || !sq_depth || !cq_depth) {
-        return scope_sync_admin_window_to_fpga(s, false);
+        return true;
     }
     if (!scope_translate_guest_pa_for_real_dma(s, s->active->guest_asq, 1, &translated_asq) ||
         !scope_translate_guest_pa_for_real_dma(s, s->active->guest_acq, 1, &translated_acq)) {
@@ -2295,7 +2183,7 @@ static bool scope_refresh_admin_queue_state(ScopeProxyState *s)
 
     scope_capture_admin_seed(s);
 
-    return scope_sync_admin_window_to_fpga(s, true);
+    return true;
 }
 
 static bool scope_sync_admin_regs_to_real(ScopeProxyState *s)
@@ -3243,8 +3131,16 @@ static ScopeSqeReadStatus scope_process_new_sq_entries(ScopeProxyState *s,
             scope_log_nvme_cmd("WRITEBACK_ERR", sq, cursor, cmd_guest_pa, &cmd);
             return SCOPE_SQE_READ_ERR;
         }
-        if (sq->qid == SCOPE_ADMIN_QID &&
-            scope_guest_mem_read(s, cmd_guest_pa, &cmd_visible, sizeof(cmd_visible))) {
+        if (sq->qid == SCOPE_ADMIN_QID) {
+            if (!scope_guest_mem_read(s, cmd_guest_pa, &cmd_visible,
+                                      sizeof(cmd_visible))) {
+                SCOPE_PRINTF("[SCOPE PROXY][CMD][VISIBLE_AFTER_WRITEBACK][WAIT] "
+                             "backend=%u qid=%u slot=%u guest_pa=0x%016"
+                             PRIx64 " readback failed\n",
+                             s->active->id, sq->qid, cursor, cmd_guest_pa);
+                SCOPE_FFLUSH(stdout);
+                return SCOPE_SQE_READ_WAIT;
+            }
             if (memcmp(&cmd, &cmd_visible, sizeof(cmd)) != 0) {
                 SCOPE_PRINTF("[SCOPE PROXY][CMD][VISIBLE_AFTER_WRITEBACK][ERR] qid=%u slot=%u "
                        "guest_pa=0x%016" PRIx64 "\n",
@@ -3256,6 +3152,7 @@ static ScopeSqeReadStatus scope_process_new_sq_entries(ScopeProxyState *s,
                                           &cmd_visible);
                 scope_log_nvme_cmd_hexdump("VISIBLE_AFTER_WRITEBACK", sq, cursor, cmd_guest_pa,
                                            &cmd_visible);
+                return SCOPE_SQE_READ_WAIT;
             } else if (have_translation) {
                 SCOPE_PRINTF("[SCOPE PROXY][CMD][VISIBLE_AFTER_WRITEBACK][OK] qid=%u slot=%u "
                        "guest_pa=0x%016" PRIx64 " host_bypass=0x%016" PRIx64 "\n",
@@ -3633,10 +3530,8 @@ static void scope_defer_sq_doorbell_write(ScopeProxyState *s, uint32_t seq, uint
                                           uint16_t qid)
 {
     uint32_t dword_data = scope_extract_dword32(data, offset);
-    ScopeSqState *sq = (qid < SCOPE_MAX_NVME_QUEUES) ? &s->active->sq[qid] : NULL;
     uint16_t new_tail = dword_data & 0xFFFFU;
     int64_t now_us = g_get_monotonic_time();
-    uint16_t cursor;
 
     if (s->active->pending_sq_db.valid) {
         SCOPE_PRINTF("[SCOPE PROXY][DB][DEFER][ERR] replacing pending SQ doorbell "
@@ -3655,27 +3550,7 @@ static void scope_defer_sq_doorbell_write(ScopeProxyState *s, uint32_t seq, uint
     s->active->pending_sq_db.qid = qid;
     s->active->pending_sq_db.new_tail = new_tail;
     s->active->pending_sq_db.pending_since_us = now_us;
-    s->active->pending_sq_db.fallback_next_try_us =
-        now_us + SCOPE_ADMIN_SQE_DONE_FALLBACK_US;
-    s->active->pending_sq_db.fallback_try_count = 0;
-    memset(s->active->pending_sq_db.slot_baseline_valid, 0,
-           sizeof(s->active->pending_sq_db.slot_baseline_valid));
-    memset(s->active->pending_sq_db.slot_baseline_seq, 0,
-           sizeof(s->active->pending_sq_db.slot_baseline_seq));
-
-    if (s->sqe_monitor_enable && sq && sq->valid && sq->depth &&
-        new_tail < sq->depth) {
-        cursor = sq->last_guest_tail;
-        while (cursor != new_tail) {
-            if (cursor < SCOPE_ADMIN_SQ_MAX_TRACKED) {
-                s->active->pending_sq_db.slot_baseline_valid[cursor] =
-                    s->active->admin_sq_slot_done_valid[cursor];
-                s->active->pending_sq_db.slot_baseline_seq[cursor] =
-                    s->active->admin_sq_slot_done_seq[cursor];
-            }
-            cursor = (cursor + 1U) % sq->depth;
-        }
-    }
+    s->active->pending_sq_db.next_visibility_retry_us = now_us;
 
     SCOPE_PRINTF("[SCOPE PROXY][DB][DEFER] qid=%u seq=%u off=0x%04x size=%u "
            "wstrb=0x%02x data=0x%016" PRIx64 " new_tail=%u\n",
@@ -3684,95 +3559,14 @@ static void scope_defer_sq_doorbell_write(ScopeProxyState *s, uint32_t seq, uint
     SCOPE_FFLUSH(stdout);
 }
 
-static bool scope_admin_sq_slots_ready(ScopeProxyState *s, const ScopeSqState *sq,
-                                       const ScopePendingDoorbell *pending)
-{
-    uint16_t new_tail = pending->new_tail;
-    uint16_t cursor;
-
-    if (!sq->valid || !sq->depth || new_tail >= sq->depth) {
-        return false;
-    }
-
-    cursor = sq->last_guest_tail;
-    while (cursor != new_tail) {
-        uint32_t done_seq = 0;
-        uint32_t consumed_seq = 0;
-        uint32_t baseline_seq = 0;
-        uint64_t done_mask = 0;
-        bool done_valid = false;
-        bool baseline_valid = false;
-
-        if (cursor < SCOPE_ADMIN_SQ_MAX_TRACKED) {
-            done_valid = s->active->admin_sq_slot_done_valid[cursor];
-            done_seq = s->active->admin_sq_slot_done_seq[cursor];
-            done_mask = s->active->admin_sq_slot_done_mask[cursor];
-            consumed_seq = s->active->admin_sq_slot_consumed_seq[cursor];
-            baseline_valid = pending->slot_baseline_valid[cursor];
-            baseline_seq = pending->slot_baseline_seq[cursor];
-        }
-
-        /*
-         * SQE_WRITE_DONE may legitimately arrive before the SQ doorbell packet.
-         * In that case the pending doorbell snapshots that done_seq as the
-         * baseline; accepting done_seq == baseline_seq is correct as long as it
-         * has not already been consumed by a previous doorbell.  Requiring a
-         * strictly newer seq here caused intermittent hangs when slot writes
-         * completed before their doorbells reached QEMU.
-         */
-        if (cursor >= SCOPE_ADMIN_SQ_MAX_TRACKED ||
-            !done_valid ||
-            done_mask != SCOPE_ADMIN_SQE_DONE_FULL_MASK ||
-            done_seq <= consumed_seq ||
-            (baseline_valid && done_seq < baseline_seq)) {
-            SCOPE_PRINTF("[SCOPE PROXY][DB][WAIT_SQE] qid=%u slot=%u new_tail=%u "
-                   "done_valid=%d done_seq=%u consumed_seq=%u "
-                   "baseline_valid=%d baseline_seq=%u done_mask=0x%016" PRIx64 "\n",
-                   sq->qid, cursor, new_tail, done_valid, done_seq,
-                   consumed_seq, baseline_valid, baseline_seq, done_mask);
-            SCOPE_FFLUSH(stdout);
-            return false;
-        }
-        cursor = (cursor + 1U) % sq->depth;
-    }
-
-    return true;
-}
-
-static void scope_mark_admin_sq_slots_consumed(ScopeProxyState *s, uint16_t old_tail,
-                                               uint16_t new_tail, uint16_t depth,
-                                               bool fallback_without_done)
-{
-    uint16_t cursor = old_tail;
-
-    while (cursor != new_tail) {
-        if (cursor < SCOPE_ADMIN_SQ_MAX_TRACKED) {
-            if (s->active->admin_sq_slot_done_valid[cursor]) {
-                s->active->admin_sq_slot_consumed_seq[cursor] =
-                    s->active->admin_sq_slot_done_seq[cursor];
-                s->active->admin_sq_slot_fallback_wait_done[cursor] = false;
-                s->active->admin_sq_slot_done_valid[cursor] = false;
-                s->active->admin_sq_slot_done_mask[cursor] = 0;
-            } else if (fallback_without_done) {
-                s->active->admin_sq_slot_fallback_wait_done[cursor] = true;
-                s->active->admin_sq_slot_done_mask[cursor] = 0;
-            }
-        }
-        cursor = (cursor + 1U) % depth;
-    }
-}
-
 static void scope_try_process_pending_sq_doorbell(ScopeProxyState *s)
 {
     ScopePendingDoorbell pending;
     ScopeSqState *sq;
-    uint16_t old_tail;
     uint32_t flags;
-    bool fallback_without_done = false;
-    bool coherent_without_monitor;
-    bool slots_ready;
     bool ok;
     int64_t now_us;
+    ScopeSqeReadStatus process_status;
 
     if (!s->active->pending_sq_db.valid) {
         return;
@@ -3791,115 +3585,50 @@ static void scope_try_process_pending_sq_doorbell(ScopeProxyState *s)
     }
 
     now_us = g_get_monotonic_time();
-    sq = &s->active->sq[s->active->pending_sq_db.qid];
-    coherent_without_monitor = !s->sqe_monitor_enable;
-    slots_ready = coherent_without_monitor ||
-                  scope_admin_sq_slots_ready(s, sq,
-                                             &s->active->pending_sq_db);
-    if (!slots_ready) {
-#if SCOPE_DEBUG_ADMIN_SQE_DONE_TIMEOUT_FALLBACK
-        if (now_us < s->active->pending_sq_db.fallback_next_try_us) {
-            return;
-        }
-        s->active->pending_sq_db.fallback_try_count++;
-        s->active->pending_sq_db.fallback_next_try_us =
-            now_us + SCOPE_ADMIN_SQE_DONE_FALLBACK_RETRY_US;
-        fallback_without_done = true;
-
-        SCOPE_PRINTF("[SCOPE PROXY][DB][FALLBACK_TRY] qid=%u seq=%u off=0x%04x "
-               "new_tail=%u try=%" PRIu64 " elapsed_us=%" PRId64
-               " wait_done_timeout_us=%u retry_us=%u\n",
-               s->active->pending_sq_db.qid, s->active->pending_sq_db.seq,
-               s->active->pending_sq_db.offset, s->active->pending_sq_db.new_tail,
-               s->active->pending_sq_db.fallback_try_count,
-               now_us - s->active->pending_sq_db.pending_since_us,
-               SCOPE_ADMIN_SQE_DONE_FALLBACK_US,
-               SCOPE_ADMIN_SQE_DONE_FALLBACK_RETRY_US);
-        SCOPE_FFLUSH(stdout);
-#else
+    if (now_us < s->active->pending_sq_db.next_visibility_retry_us) {
         return;
-#endif
     }
 
+    sq = &s->active->sq[s->active->pending_sq_db.qid];
     pending = s->active->pending_sq_db;
-    old_tail = sq->last_guest_tail;
+    process_status = scope_process_new_sq_entries(s, sq, pending.new_tail,
+                                                   false);
+    if (process_status != SCOPE_SQE_READ_OK) {
+        s->active->pending_sq_db.next_visibility_retry_us =
+            now_us + SCOPE_ADMIN_SQE_VISIBILITY_RETRY_US;
+        SCOPE_PRINTF("[SCOPE PROXY][DB][WAIT_SQE_VISIBLE] backend=%u qid=%u "
+                     "seq=%u off=0x%04x last_tail=%u new_tail=%u status=%d "
+                     "retry_us=%u\n",
+                     s->active->id, pending.qid, pending.seq, pending.offset,
+                     sq->last_guest_tail, pending.new_tail, process_status,
+                     SCOPE_ADMIN_SQE_VISIBILITY_RETRY_US);
+        SCOPE_FFLUSH(stdout);
+        return;
+    }
 
-    SCOPE_PRINTF("[SCOPE PROXY][DB][%s] qid=%u seq=%u off=0x%04x new_tail=%u\n",
-           coherent_without_monitor ? "COHERENT_READY" :
-           fallback_without_done ? "FALLBACK_READY" : "READY",
-           pending.qid, pending.seq, pending.offset, pending.new_tail);
+    SCOPE_PRINTF("[SCOPE PROXY][DB][SQE_VISIBLE] backend=%u qid=%u seq=%u "
+                 "off=0x%04x new_tail=%u\n",
+                 s->active->id, pending.qid, pending.seq, pending.offset,
+                 pending.new_tail);
     SCOPE_FFLUSH(stdout);
 
-    ok = false;
-    if (pending.qid == SCOPE_ADMIN_QID) {
-        ScopeSqeReadStatus process_status =
-            scope_process_new_sq_entries(s, sq, pending.new_tail,
-                                          false);
-
-        if (process_status == SCOPE_SQE_READ_WAIT) {
-            s->active->pending_sq_db.fallback_next_try_us =
-                now_us + SCOPE_ADMIN_SQE_VISIBILITY_RETRY_US;
-            SCOPE_PRINTF("[SCOPE PROXY][DB][%s] qid=%u seq=%u "
-                   "off=0x%04x new_tail=%u retry_us=%u\n",
-                   coherent_without_monitor ? "COHERENT_WAIT_VISIBLE" :
-                   fallback_without_done ? "FALLBACK_WAIT_VISIBLE" :
-                                           "WAIT_SQE_VISIBLE",
-                   pending.qid, pending.seq, pending.offset, pending.new_tail,
-                   SCOPE_ADMIN_SQE_VISIBILITY_RETRY_US);
-            SCOPE_FFLUSH(stdout);
-            return;
-        }
-        if (process_status != SCOPE_SQE_READ_OK) {
-            SCOPE_PRINTF("[SCOPE PROXY][DB][SQ][%s] qid=%u last_tail=%u new_tail=%u "
-                   "depth=%u guest_base=0x%016" PRIx64 " status=%d\n",
-                   coherent_without_monitor ? "COHERENT_NOT_READY" :
-                   fallback_without_done ? "FALLBACK_NOT_READY" : "ERR",
-                   pending.qid, sq->last_guest_tail, pending.new_tail,
-                   sq->depth, sq->guest_base, process_status);
-            SCOPE_FFLUSH(stdout);
-            if (coherent_without_monitor || fallback_without_done) {
-                s->active->pending_sq_db.fallback_next_try_us =
-                    now_us + (coherent_without_monitor ?
-                              SCOPE_ADMIN_SQE_VISIBILITY_RETRY_US :
-                              SCOPE_ADMIN_SQE_DONE_FALLBACK_RETRY_US);
-                return;
-            }
-        } else {
-            uint32_t aligned_offset = pending.offset & ~0x3U;
-
-            ok = scope_real_bar_write(s, aligned_offset, pending.data,
-                                      pending.wstrb, pending.size_bytes);
-            if (!ok) {
-                SCOPE_PRINTF("[SCOPE PROXY][DB][ERR] failed to forward deferred doorbell "
-                       "off=0x%04x aligned=0x%04x data=0x%016" PRIx64
-                       " wstrb=0x%02x\n",
-                       pending.offset, aligned_offset, pending.data, pending.wstrb);
-                SCOPE_FFLUSH(stdout);
-            }
-        }
-    }
+    ok = scope_real_bar_write(s, pending.offset & ~0x3U, pending.data,
+                              pending.wstrb, pending.size_bytes);
     flags = ((uint32_t)pending.size_bytes << 8) | pending.wstrb;
     scope_log_bar_write(s, pending.seq, pending.offset, flags, pending.size_bytes,
                         pending.wstrb, pending.data, ok);
     if (ok) {
-        scope_mark_admin_sq_slots_consumed(s, old_tail, pending.new_tail,
-                                           sq->depth, fallback_without_done);
-        if (fallback_without_done) {
-            SCOPE_PRINTF("[SCOPE PROXY][DB][FALLBACK_FORWARDED] qid=%u seq=%u "
-                   "off=0x%04x new_tail=%u try=%" PRIu64 "\n",
-                   pending.qid, pending.seq, pending.offset, pending.new_tail,
-                   pending.fallback_try_count);
-            SCOPE_FFLUSH(stdout);
-        } else if (coherent_without_monitor) {
-            SCOPE_PRINTF("[SCOPE PROXY][DB][COHERENT_FORWARDED] qid=%u seq=%u "
-                   "off=0x%04x new_tail=%u\n",
-                   pending.qid, pending.seq, pending.offset, pending.new_tail);
-            SCOPE_FFLUSH(stdout);
-        }
+        SCOPE_PRINTF("[SCOPE PROXY][DB][FORWARD_REAL_DB] backend=%u qid=%u "
+                     "seq=%u off=0x%04x new_tail=%u\n",
+                     s->active->id, pending.qid, pending.seq, pending.offset,
+                     pending.new_tail);
+        SCOPE_FFLUSH(stdout);
         s->active->pending_sq_db.valid = false;
     } else {
+        s->active->pending_sq_db.next_visibility_retry_us =
+            now_us + SCOPE_ADMIN_SQE_VISIBILITY_RETRY_US;
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "SCOPE: Deferred SQ doorbell processing failed after SQE done\n");
+                      "SCOPE: failed to forward deferred SQ doorbell to real NVMe\n");
     }
 }
 
@@ -4060,9 +3789,6 @@ static bool scope_handle_nvme_bar_write(ScopeProxyState *s, uint32_t offset, uin
 
         if (!NVME_CC_EN(s->active->guest_cc)) {
             scope_reset_all_queue_state(s);
-            if (!scope_sync_admin_window_to_fpga(s, false)) {
-                return false;
-            }
             scope_update_virtual_intx(s);
         } else if (!NVME_CC_EN(old_cc)) {
             scope_reset_all_queue_state(s);
@@ -4242,103 +3968,6 @@ static bool scope_recover_missing_bar_done(ScopeProxyState *s, int64_t now_us)
     SCOPE_FFLUSH(stdout);
     scope_try_process_pending_sq_doorbell(s);
     return true;
-}
-
-static void scope_process_sqe_write_done_packet(ScopeProxyState *s,
-                                                const struct scope_dma32_packet *pkt)
-{
-    uint16_t slot = SCOPE_VSWITCH_SQE_SLOT(pkt->flags);
-    uint16_t qid = SCOPE_VSWITCH_SQE_QID(pkt->flags);
-    uint8_t bresp = SCOPE_VSWITCH_SQE_BRESP(pkt->flags);
-    uint8_t backend_id = SCOPE_VSWITCH_SQE_BACKEND(pkt->flags);
-    bool overflow = SCOPE_VSWITCH_SQE_OVERFLOW(pkt->flags);
-    uint32_t bytes = pkt->data;
-    uint64_t guest_pa = ((uint64_t)pkt->guest_addr_lo << 32) | pkt->bar_offset;
-    uint64_t expected_pa = 0;
-    uint64_t done_mask = 0;
-    uint64_t new_mask = 0;
-
-    if (!s->sqe_monitor_enable) {
-        return;
-    }
-
-    if (backend_id >= s->backend_count) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "SCOPE: SQE DONE references inactive backend %u\n", backend_id);
-        return;
-    }
-    s->active = &s->backends[backend_id];
-
-    if (qid == SCOPE_ADMIN_QID) {
-        SCOPE_PRINTF("[SCOPE PROXY][SQE][DONE] backend=%u virtual=%02x:00.0 "
-               "qid=%u slot=%u seq=%u guest_pa=0x%016"
-               PRIx64 " bytes=%u bresp=0x%x overflow=%d\n",
-               backend_id, 3U + backend_id, qid, slot, pkt->seq, guest_pa,
-               bytes, bresp, overflow);
-        SCOPE_FFLUSH(stdout);
-    } else {
-        SCOPE_IO_PRINTF("[SCOPE PROXY][SQE][DONE] qid=%u slot=%u seq=%u guest_pa=0x%016"
-               PRIx64 " bytes=%u bresp=0x%x overflow=%d\n",
-               qid, slot, pkt->seq, guest_pa, bytes, bresp, overflow);
-        SCOPE_IO_FFLUSH(stdout);
-    }
-
-    if (overflow) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "SCOPE: SQE write-done monitor overflow was observed\n");
-    }
-    if (bresp != 0) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "SCOPE: SQE write completed with AXI bresp=0x%x\n", bresp);
-        return;
-    }
-    if (qid != SCOPE_ADMIN_QID || slot >= SCOPE_ADMIN_SQ_MAX_TRACKED) {
-        return;
-    }
-
-    if (s->active->sq[SCOPE_ADMIN_QID].valid) {
-        expected_pa = s->active->sq[SCOPE_ADMIN_QID].guest_base +
-                      (uint64_t)slot * sizeof(NvmeCmd);
-        if (guest_pa != expected_pa) {
-            SCOPE_PRINTF("[SCOPE PROXY][SQE][DONE][WARN] qid=%u slot=%u guest_pa=0x%016"
-                   PRIx64 " expected=0x%016" PRIx64 "\n",
-                   qid, slot, guest_pa, expected_pa);
-            SCOPE_FFLUSH(stdout);
-        }
-    }
-
-    done_mask = scope_admin_sqe_done_mask_for_packet(guest_pa, bytes, expected_pa);
-    new_mask = s->active->admin_sq_slot_done_mask[slot] | done_mask;
-    s->active->admin_sq_slot_done_mask[slot] = new_mask;
-
-    SCOPE_PRINTF("[SCOPE PROXY][SQE][DONE][COVER] backend=%u qid=%u slot=%u seq=%u "
-           "packet_mask=0x%016" PRIx64 " slot_mask=0x%016" PRIx64 "\n",
-           backend_id, qid, slot, pkt->seq, done_mask, new_mask);
-    SCOPE_FFLUSH(stdout);
-
-    if (new_mask != SCOPE_ADMIN_SQE_DONE_FULL_MASK) {
-        SCOPE_PRINTF("[SCOPE PROXY][SQE][DONE][PARTIAL] backend=%u qid=%u "
-               "slot=%u seq=%u "
-               "bytes=%u guest_pa=0x%016" PRIx64 " expected=0x%016" PRIx64 "\n",
-               backend_id, qid, slot, pkt->seq, bytes, guest_pa, expected_pa);
-        SCOPE_FFLUSH(stdout);
-        scope_try_process_pending_sq_doorbell(s);
-        return;
-    }
-
-    s->active->admin_sq_slot_done_valid[slot] = true;
-    s->active->admin_sq_slot_done_seq[slot] = pkt->seq;
-    if (s->active->admin_sq_slot_fallback_wait_done[slot]) {
-        s->active->admin_sq_slot_consumed_seq[slot] = pkt->seq;
-        s->active->admin_sq_slot_fallback_wait_done[slot] = false;
-        s->active->admin_sq_slot_done_valid[slot] = false;
-        s->active->admin_sq_slot_done_mask[slot] = 0;
-        SCOPE_PRINTF("[SCOPE PROXY][SQE][DONE][FALLBACK_CONSUMED] qid=%u slot=%u "
-               "seq=%u\n",
-               qid, slot, pkt->seq);
-        SCOPE_FFLUSH(stdout);
-    }
-    scope_try_process_pending_sq_doorbell(s);
 }
 
 static void scope_process_bar_packet(ScopeProxyState *s, const struct scope_dma32_packet *pkt)
@@ -4571,8 +4200,6 @@ static bool scope_poll_dma32_ring(ScopeProxyState *s,
         qemu_mutex_lock(&s->state_lock);
         if (pkt.type == SCOPE_PKT_TYPE_CFG_WRITE) {
             scope_process_cfg_packet(s, &pkt);
-        } else if (pkt.type == SCOPE_PKT_TYPE_SQE_WRITE_DONE) {
-            scope_process_sqe_write_done_packet(s, &pkt);
         } else if (pkt.type == SCOPE_PKT_TYPE_BAR_WRITE ||
                    pkt.type == SCOPE_PKT_TYPE_BAR_READ ||
                    pkt.type == SCOPE_PKT_TYPE_BAR_WRITE_DONE) {
@@ -4626,7 +4253,7 @@ static void *scope_proxy_rx_thread(void *opaque)
                 }
                 if (s->active->pending_sq_db.valid &&
                     s->active->pending_sq_db.bar_done &&
-                    now_us >= s->active->pending_sq_db.fallback_next_try_us) {
+                    now_us >= s->active->pending_sq_db.next_visibility_retry_us) {
                     scope_try_process_pending_sq_doorbell(s);
                     progressed = true;
                 }
@@ -5014,30 +4641,18 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
         goto fail;
     }
     if (!scope_set_proxy_ctrl_bits(s, PROXY_CTRL_ECAM_SHADOW_READY, errp)) goto fail;
-    qemu_mutex_lock(&s->xdma_lock);
-    if (!scope_xdma_write32_locked(s, SQE_MON_CFG_BASE + MON_REG_STATUS,
-                                   MON_STATUS_OVERFLOW)) {
-        qemu_mutex_unlock(&s->xdma_lock);
-        error_setg(errp, "Failed to clear SQE monitor status during startup");
-        goto fail;
-    }
-    qemu_mutex_unlock(&s->xdma_lock);
     for (i = 0; i < SCOPE_VSWITCH_MAX_NVME; i++) {
         uint32_t route = HOST_MBX_BASE + SCOPE_ROUTE_BASE + i * SCOPE_ROUTE_STRIDE;
         qemu_mutex_lock(&s->xdma_lock);
         scope_xdma_write32_locked(s, route + SCOPE_ROUTE_CTRL, 0);
-        scope_xdma_write32_locked(s,
-                                  SQE_MON_CFG_BASE + i * MON_BACKEND_STRIDE +
-                                  MON_REG_ADMIN_SQ_CTRL,
-                                  0);
         qemu_mutex_unlock(&s->xdma_lock);
     }
     for (i = 0; i < s->backend_count; i++) {
         s->active = &s->backends[i];
         if (!scope_sync_guest_bar_shadow(s, &s->vcfg[SCOPE_VSWITCH_NVME_SLOT(i)],
-                                         s->active, errp) ||
-            !scope_sync_admin_window_to_fpga(s, false)) goto fail;
+                                         s->active, errp)) goto fail;
     }
+    if (!scope_set_proxy_ctrl_bits(s, PROXY_CTRL_BAR_ROUTE_READY, errp)) goto fail;
 
     qemu_mutex_lock(&s->xdma_lock);
     if (!scope_xdma_write32_locked(s, HOST_MBX_BASE + MBX_REG_ACK, dummy_ack)) {
@@ -5069,8 +4684,7 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     SCOPE_PRINTF("[SCOPE PROXY] QEMU guest memory access alias offset=0x%016" PRIx64
            ", raw_fallback=%d\n",
            s->bypass_coherent_alias_base, s->guest_mem_raw_fallback);
-    SCOPE_PRINTF("[SCOPE PROXY] SQE visibility mode=%s\n",
-           s->sqe_monitor_enable ? "write-done-monitor" : "coherent-alias-read");
+    SCOPE_PRINTF("[SCOPE PROXY] SQE visibility mode=coherent-alias-stable-read\n");
     SCOPE_PRINTF("[SCOPE PROXY] BAR_DONE timeout recovery=%s timeout_us=%u\n",
            s->bar_done_timeout_us ? "enabled" : "disabled",
            s->bar_done_timeout_us);
@@ -5121,7 +4735,6 @@ static void scope_proxy_instance_init(Object *obj)
     s->fpga_bypass_bar_size = 0;
     s->bypass_coherent_alias_base = SCOPE_DEFAULT_BYPASS_COHERENT_ALIAS_BASE;
     s->guest_mem_raw_fallback = false;
-    s->sqe_monitor_enable = false;
     s->fpga_bypass_bar_index = -1;
     s->guest_ddr_base = 0;
     s->guest_ddr_size = 0;
@@ -5153,8 +4766,6 @@ static const Property scope_proxy_properties[] = {
                        SCOPE_DEFAULT_BYPASS_COHERENT_ALIAS_BASE),
     DEFINE_PROP_BOOL("guest-mem-raw-fallback", ScopeProxyState,
                      guest_mem_raw_fallback, false),
-    DEFINE_PROP_BOOL("sqe-monitor-enable", ScopeProxyState,
-                     sqe_monitor_enable, false),
     DEFINE_PROP_BOOL("intx-retry-pulse", ScopeProxyState,
                      intx_retry_pulse, false),
 };
