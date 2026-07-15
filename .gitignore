@@ -1,7 +1,9 @@
 /GNUmakefile
 /build/
+/build.*/
 /.cache/
 /.vscode/
+/.Xil/
 *.pyc
 .sdk
 .stgit-*
@@ -20,3 +22,24 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+*.jou
+*.log
+*.str
+*.orig
+*.rej
+*.bak
+
+# Local SCOPE proxy snapshots and experiments
+/hw/misc/* copy.c
+/hw/misc/*.pre_*.c
+/hw/misc/*_[0-9][0-9][0-9][0-9][0-9][0-9].c
+/hw/misc/*_20[0-9][0-9][0-9][0-9][0-9][0-9].c
+/hw/misc/*_bak*.c
+/hw/misc/*_bak*.h
+/hw/misc/scope_fpga_proxy_irq.c
+/hw/misc/scope_original.c
+
+# Generated directories replacing QEMU's tracked subproject symlinks
+/subprojects/libvduse/linux-headers/linux/
+/subprojects/libvduse/standard-headers/linux/
+/subprojects/libvhost-user/standard-headers/linux/
