@@ -98,6 +98,7 @@ static bool scope_nvme_backend_poll(ScopeProxyState *s, int64_t now_us)
 
 static const ScopeBackendOps scope_nvme_backend_ops = {
     .name = "nvme",
+    .requires_real_pci = true,
     .realize = scope_nvme_backend_realize,
     .cleanup = scope_nvme_backend_cleanup,
     .process_bar_packet = scope_nvme_backend_process_bar_packet,

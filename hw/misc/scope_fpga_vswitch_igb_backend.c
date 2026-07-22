@@ -29,12 +29,17 @@
 typedef struct ScopeIgbPendingTail {
     bool valid;
     bool bar_done;
-    bool tx;
     uint32_t seq;
     uint16_t tail;
     int64_t pending_since_us;
     int64_t next_retry_us;
 } ScopeIgbPendingTail;
+
+typedef struct ScopeIgbPendingQueue {
+    ScopeIgbPendingTail entries[SCOPE_IGB_PENDING_DEPTH];
+    uint16_t head;
+    uint16_t count;
+} ScopeIgbPendingQueue;
 
 typedef struct ScopeIgbQueueState {
     uint64_t guest_base;
@@ -49,9 +54,8 @@ typedef struct ScopeIgbQueueState {
 struct ScopeIgbState {
     ScopeIgbQueueState tx;
     ScopeIgbQueueState rx;
-    ScopeIgbPendingTail pending[SCOPE_IGB_PENDING_DEPTH];
-    uint16_t pending_head;
-    uint16_t pending_count;
+    ScopeIgbPendingQueue tx_pending;
+    ScopeIgbPendingQueue rx_pending;
     uint32_t virtual_icr;
     uint32_t virtual_ims;
     uint32_t last_status;
@@ -90,6 +94,27 @@ static uint32_t scope_igb_rx_header_size(const ScopeIgbState *igb)
 {
     return (igb->rx.srrctl & E1000_SRRCTL_BSIZEHDR_MASK) >>
            E1000_SRRCTL_BSIZEHDRSIZE_SHIFT;
+}
+
+static uint32_t scope_igb_rx_desc_type(const ScopeIgbState *igb)
+{
+    return igb->rx.srrctl & E1000_SRRCTL_DESCTYPE_MASK;
+}
+
+static bool scope_igb_rx_uses_header_buffer(const ScopeIgbState *igb)
+{
+    uint32_t desc_type = scope_igb_rx_desc_type(igb);
+
+    return desc_type == E1000_SRRCTL_DESCTYPE_HDR_SPLIT ||
+           desc_type == E1000_SRRCTL_DESCTYPE_HDR_SPLIT_ALWAYS;
+}
+
+static bool scope_igb_rx_desc_type_supported(const ScopeIgbState *igb)
+{
+    uint32_t desc_type = scope_igb_rx_desc_type(igb);
+
+    return desc_type == E1000_SRRCTL_DESCTYPE_ADV_ONEBUF ||
+           scope_igb_rx_uses_header_buffer(igb);
 }
 
 static bool scope_igb_sync_ring(ScopeProxyState *s, ScopeIgbQueueState *q,
@@ -146,11 +171,15 @@ static bool scope_igb_sync_ring_report(ScopeProxyState *s,
     return ok;
 }
 
-static void scope_igb_mark_ring_reconfigured(ScopeIgbQueueState *q)
+static void scope_igb_mark_ring_reconfigured(ScopeIgbState *igb, bool tx)
 {
+    ScopeIgbQueueState *q = tx ? &igb->tx : &igb->rx;
+    ScopeIgbPendingQueue *pending = tx ? &igb->tx_pending : &igb->rx_pending;
+
     q->translated_base = 0;
     q->forwarded_tail = 0;
     q->tail_valid = false;
+    memset(pending, 0, sizeof(*pending));
 }
 
 static bool scope_igb_read_stable_desc(ScopeProxyState *s, uint64_t guest_pa,
@@ -262,7 +291,8 @@ static bool scope_igb_patch_tx_range(ScopeProxyState *s, uint16_t new_tail)
     return scope_igb_real_write32(s, SCOPE_IGB_TDT0, new_tail);
 }
 
-static bool scope_igb_patch_rx_range(ScopeProxyState *s, uint16_t new_tail)
+static bool scope_igb_patch_rx_range(ScopeProxyState *s, uint16_t new_tail,
+                                     bool *permanent_error)
 {
     ScopeIgbState *igb = s->active->igb;
     ScopeIgbQueueState *q = &igb->rx;
@@ -271,6 +301,10 @@ static bool scope_igb_patch_rx_range(ScopeProxyState *s, uint16_t new_tail)
     unsigned int count = 0;
     uint64_t verify_pa = 0;
     union e1000_adv_rx_desc verify_desc = { 0 };
+    uint32_t desc_type = scope_igb_rx_desc_type(igb);
+    bool uses_header = scope_igb_rx_uses_header_buffer(igb);
+
+    *permanent_error = false;
 
     if (!q->guest_base || !q->ring_bytes ||
         !(q->control & E1000_RXDCTL_QUEUE_ENABLE)) {
@@ -293,18 +327,34 @@ static bool scope_igb_patch_rx_range(ScopeProxyState *s, uint16_t new_tail)
         }
         pkt_addr = le64_to_cpu(desc.read.pkt_addr);
         hdr_addr = le64_to_cpu(desc.read.hdr_addr);
+        if (!scope_igb_rx_desc_type_supported(igb)) {
+            SCOPE_PRINTF("[SCOPE IGB][RX_DESC_TYPE][ERR] backend=%u "
+                         "index=%u guest_pa=0x%016" PRIx64
+                         " old_tail=%u new_tail=%u srrctl=0x%08x "
+                         "desc_type=0x%08x qword0=0x%016" PRIx64
+                         " qword1=0x%016" PRIx64 "\n",
+                         s->active->id, index, guest_pa, q->forwarded_tail,
+                         new_tail, q->srrctl, desc_type, pkt_addr, hdr_addr);
+            igb->address_errors++;
+            igb->virtual_icr |= E1000_ICR_RXO;
+            *permanent_error = true;
+            return false;
+        }
         if (!scope_igb_patch_dma_addr(s, &pkt_addr,
                                       scope_igb_rx_packet_size(igb),
                                       "igb-rx-packet") ||
-            !scope_igb_patch_dma_addr(s, &hdr_addr,
-                                      scope_igb_rx_header_size(igb),
-                                      "igb-rx-header")) {
+            (uses_header && hdr_addr &&
+             !scope_igb_patch_dma_addr(s, &hdr_addr,
+                                       scope_igb_rx_header_size(igb),
+                                       "igb-rx-header"))) {
             igb->address_errors++;
             igb->virtual_icr |= E1000_ICR_RXO;
             return false;
         }
         desc.read.pkt_addr = cpu_to_le64(pkt_addr);
-        desc.read.hdr_addr = cpu_to_le64(hdr_addr);
+        if (uses_header) {
+            desc.read.hdr_addr = cpu_to_le64(hdr_addr);
+        }
         if (!scope_guest_mem_write(s, guest_pa, &desc, sizeof(desc))) {
             return false;
         }
@@ -327,25 +377,34 @@ static bool scope_igb_patch_rx_range(ScopeProxyState *s, uint16_t new_tail)
     return scope_igb_real_write32(s, SCOPE_IGB_RDT0, new_tail);
 }
 
-static ScopeIgbPendingTail *scope_igb_pending_at(ScopeIgbState *igb,
+static ScopeIgbPendingTail *scope_igb_pending_at(ScopeIgbPendingQueue *queue,
                                                  unsigned int n)
 {
-    return &igb->pending[(igb->pending_head + n) % SCOPE_IGB_PENDING_DEPTH];
+    return &queue->entries[(queue->head + n) % SCOPE_IGB_PENDING_DEPTH];
 }
 
 static bool scope_igb_defer_tail(ScopeProxyState *s, uint32_t seq,
                                  uint32_t offset, uint64_t data)
 {
     ScopeIgbState *igb = s->active->igb;
+    bool tx = offset == SCOPE_IGB_TDT0;
+    ScopeIgbPendingQueue *queue;
     ScopeIgbPendingTail *pending;
 
-    if (!igb || igb->pending_count == SCOPE_IGB_PENDING_DEPTH) {
+    if (!igb) {
         return false;
     }
-    pending = scope_igb_pending_at(igb, igb->pending_count++);
+    queue = tx ? &igb->tx_pending : &igb->rx_pending;
+    if (queue->count == SCOPE_IGB_PENDING_DEPTH) {
+        SCOPE_PRINTF("[SCOPE IGB][PENDING][FULL] backend=%u direction=%s "
+                     "seq=%u tail=%u\n",
+                     s->active->id, tx ? "tx" : "rx", seq,
+                     scope_extract_dword32(data, offset));
+        return false;
+    }
+    pending = scope_igb_pending_at(queue, queue->count++);
     *pending = (ScopeIgbPendingTail) {
         .valid = true,
-        .tx = offset == SCOPE_IGB_TDT0,
         .seq = seq,
         .tail = scope_extract_dword32(data, offset),
         .pending_since_us = g_get_monotonic_time(),
@@ -357,13 +416,24 @@ static bool scope_igb_defer_tail(ScopeProxyState *s, uint32_t seq,
 static bool scope_igb_mark_bar_done(ScopeProxyState *s, uint32_t seq)
 {
     ScopeIgbState *igb = s->active->igb;
+    ScopeIgbPendingQueue *queues[2];
+    unsigned int q;
     unsigned int i;
 
-    for (i = 0; igb && i < igb->pending_count; i++) {
-        ScopeIgbPendingTail *pending = scope_igb_pending_at(igb, i);
-        if (pending->valid && pending->seq == seq) {
-            pending->bar_done = true;
-            return true;
+    if (!igb) {
+        return false;
+    }
+    queues[0] = &igb->tx_pending;
+    queues[1] = &igb->rx_pending;
+    for (q = 0; q < ARRAY_SIZE(queues); q++) {
+        for (i = 0; i < queues[q]->count; i++) {
+            ScopeIgbPendingTail *pending =
+                scope_igb_pending_at(queues[q], i);
+
+            if (pending->valid && pending->seq == seq) {
+                pending->bar_done = true;
+                return true;
+            }
         }
     }
     return false;
@@ -469,19 +539,22 @@ static bool scope_igb_bar_write(ScopeProxyState *s, uint32_t offset,
     case SCOPE_IGB_TDBAL0:
         igb->tx.guest_base = (igb->tx.guest_base & 0xffffffff00000000ULL) |
                              (value & ~0x7fU);
-        scope_igb_mark_ring_reconfigured(&igb->tx);
+        scope_igb_mark_ring_reconfigured(igb, true);
         return true;
     case SCOPE_IGB_TDBAH0:
         igb->tx.guest_base = (igb->tx.guest_base & UINT32_MAX) |
                              ((uint64_t)value << 32);
-        scope_igb_mark_ring_reconfigured(&igb->tx);
+        scope_igb_mark_ring_reconfigured(igb, true);
         return true;
     case SCOPE_IGB_TDLEN0:
         igb->tx.ring_bytes = value;
-        scope_igb_mark_ring_reconfigured(&igb->tx);
+        scope_igb_mark_ring_reconfigured(igb, true);
         return true;
     case SCOPE_IGB_TXDCTL0:
         igb->tx.control = value;
+        if (!(value & E1000_TXDCTL_QUEUE_ENABLE)) {
+            scope_igb_mark_ring_reconfigured(igb, true);
+        }
         if ((value & E1000_TXDCTL_QUEUE_ENABLE) &&
             !scope_igb_sync_ring_report(s, &igb->tx, true)) {
             return false;
@@ -490,19 +563,22 @@ static bool scope_igb_bar_write(ScopeProxyState *s, uint32_t offset,
     case SCOPE_IGB_RDBAL0:
         igb->rx.guest_base = (igb->rx.guest_base & 0xffffffff00000000ULL) |
                              (value & ~0x7fU);
-        scope_igb_mark_ring_reconfigured(&igb->rx);
+        scope_igb_mark_ring_reconfigured(igb, false);
         return true;
     case SCOPE_IGB_RDBAH0:
         igb->rx.guest_base = (igb->rx.guest_base & UINT32_MAX) |
                              ((uint64_t)value << 32);
-        scope_igb_mark_ring_reconfigured(&igb->rx);
+        scope_igb_mark_ring_reconfigured(igb, false);
         return true;
     case SCOPE_IGB_RDLEN0:
         igb->rx.ring_bytes = value;
-        scope_igb_mark_ring_reconfigured(&igb->rx);
+        scope_igb_mark_ring_reconfigured(igb, false);
         return true;
     case SCOPE_IGB_RXDCTL0:
         igb->rx.control = value;
+        if (!(value & E1000_RXDCTL_QUEUE_ENABLE)) {
+            scope_igb_mark_ring_reconfigured(igb, false);
+        }
         if ((value & E1000_RXDCTL_QUEUE_ENABLE) &&
             !scope_igb_sync_ring_report(s, &igb->rx, false)) {
             return false;
@@ -521,10 +597,45 @@ static bool scope_igb_bar_write(ScopeProxyState *s, uint32_t offset,
     }
 }
 
+static bool scope_igb_poll_pending_queue(ScopeProxyState *s,
+                                         ScopeIgbPendingQueue *queue,
+                                         bool tx, int64_t now_us)
+{
+    ScopeIgbPendingTail *pending;
+    bool permanent_error = false;
+    bool ok;
+
+    if (!queue->count) {
+        return false;
+    }
+    pending = scope_igb_pending_at(queue, 0);
+    if (!pending->bar_done && s->bar_done_timeout_us &&
+        now_us - pending->pending_since_us >= s->bar_done_timeout_us) {
+        pending->bar_done = true;
+        SCOPE_PRINTF("[SCOPE IGB][BAR_DONE_INFERRED] backend=%u "
+                     "direction=%s seq=%u\n",
+                     s->active->id, tx ? "tx" : "rx", pending->seq);
+    }
+    if (!pending->bar_done || now_us < pending->next_retry_us) {
+        return false;
+    }
+
+    ok = tx ? scope_igb_patch_tx_range(s, pending->tail) :
+              scope_igb_patch_rx_range(s, pending->tail, &permanent_error);
+    if (!ok && !permanent_error) {
+        pending->next_retry_us = now_us + SCOPE_IGB_VISIBILITY_RETRY_US;
+        return false;
+    }
+
+    memset(pending, 0, sizeof(*pending));
+    queue->head = (queue->head + 1U) % SCOPE_IGB_PENDING_DEPTH;
+    queue->count--;
+    return ok || permanent_error;
+}
+
 static bool scope_igb_poll(ScopeProxyState *s, int64_t now_us)
 {
     ScopeIgbState *igb = s->active->igb;
-    ScopeIgbPendingTail *pending;
     uint32_t causes = 0;
     uint32_t status = 0;
     bool progressed = false;
@@ -542,30 +653,10 @@ static bool scope_igb_poll(ScopeProxyState *s, int64_t now_us)
         igb->last_status = status;
         progressed = true;
     }
-    if (!igb->pending_count) {
-        s->active->intx_pending =
-            (igb->virtual_icr & igb->virtual_ims & SCOPE_IGB_SUPPORTED_CAUSES) != 0;
-        return progressed;
-    }
-    pending = scope_igb_pending_at(igb, 0);
-    if (!pending->bar_done && s->bar_done_timeout_us &&
-        now_us - pending->pending_since_us >= s->bar_done_timeout_us) {
-        pending->bar_done = true;
-        SCOPE_PRINTF("[SCOPE IGB][BAR_DONE_INFERRED] backend=%u seq=%u\n",
-                     s->active->id, pending->seq);
-    }
-    if (pending->bar_done && now_us >= pending->next_retry_us) {
-        bool ok = pending->tx ? scope_igb_patch_tx_range(s, pending->tail) :
-                               scope_igb_patch_rx_range(s, pending->tail);
-        if (ok) {
-            memset(pending, 0, sizeof(*pending));
-            igb->pending_head = (igb->pending_head + 1U) % SCOPE_IGB_PENDING_DEPTH;
-            igb->pending_count--;
-            progressed = true;
-        } else {
-            pending->next_retry_us = now_us + SCOPE_IGB_VISIBILITY_RETRY_US;
-        }
-    }
+    progressed |= scope_igb_poll_pending_queue(s, &igb->tx_pending, true,
+                                                now_us);
+    progressed |= scope_igb_poll_pending_queue(s, &igb->rx_pending, false,
+                                                now_us);
     s->active->intx_pending =
         (igb->virtual_icr & igb->virtual_ims & SCOPE_IGB_SUPPORTED_CAUSES) != 0;
     return progressed;
@@ -739,9 +830,8 @@ static bool scope_igb_reset_real(ScopeProxyState *s, Error **errp)
     if (igb) {
         memset(&igb->tx, 0, sizeof(igb->tx));
         memset(&igb->rx, 0, sizeof(igb->rx));
-        memset(igb->pending, 0, sizeof(igb->pending));
-        igb->pending_head = 0;
-        igb->pending_count = 0;
+        memset(&igb->tx_pending, 0, sizeof(igb->tx_pending));
+        memset(&igb->rx_pending, 0, sizeof(igb->rx_pending));
         igb->virtual_icr = 0;
         igb->virtual_ims = 0;
         igb->last_status = status;
@@ -783,6 +873,7 @@ static void scope_igb_backend_cleanup(ScopeProxyState *s, ScopeBackend *be)
 
 static const ScopeBackendOps scope_igb_backend_ops = {
     .name = "igb",
+    .requires_real_pci = true,
     .preflight = scope_igb_backend_preflight,
     .realize = scope_igb_backend_realize,
     .cleanup = scope_igb_backend_cleanup,

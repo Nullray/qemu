@@ -11,9 +11,12 @@
 #include "block/nvme.h"
 #include "hw/net/igb_regs.h"
 #include "hw/misc/scope_fpga_vswitch_abi.h"
+#include "hw/misc/scope_vortex_bridge_proto.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -87,6 +90,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 #define SCOPE_ROUTE_BDF               0x0cU
 #define SCOPE_ROUTE_CTRL              0x10U
 #define SCOPE_BACKEND_CONFIG_MAX      (64U * 1024U)
+#define SCOPE_VORTEX_BAR0_SIZE        0x1000U
+#define SCOPE_VORTEX_PCI_CLASS        0x1200U
 
 #ifndef SCOPE_PROXY_LOG_ENABLE
 #define SCOPE_PROXY_LOG_ENABLE 1
@@ -94,6 +99,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 
 #ifndef SCOPE_PROXY_LOG_IO
 #define SCOPE_PROXY_LOG_IO 0
+#endif
+
+#ifndef SCOPE_PROXY_LOG_INTX
+#define SCOPE_PROXY_LOG_INTX 0
 #endif
 
 #ifndef SCOPE_PROXY_LOG_TIMESTAMP
@@ -147,6 +156,12 @@ static void scope_log_continue_printf(const char *fmt, ...)
 #define SCOPE_IO_PRINTF_CONT(...) do { if (0) fprintf(stdout, __VA_ARGS__); } while (0)
 #endif
 
+#if SCOPE_PROXY_LOG_ENABLE && SCOPE_PROXY_LOG_INTX
+#define SCOPE_INTX_PRINTF(...) scope_log_printf(__VA_ARGS__)
+#else
+#define SCOPE_INTX_PRINTF(...) do { if (0) fprintf(stdout, __VA_ARGS__); } while (0)
+#endif
+
 #if SCOPE_PROXY_LOG_ENABLE && SCOPE_PROXY_LOG_FLUSH
 #define SCOPE_FFLUSH(stream) fflush(stream)
 #else
@@ -157,6 +172,12 @@ static void scope_log_continue_printf(const char *fmt, ...)
 #define SCOPE_IO_FFLUSH(stream) fflush(stream)
 #else
 #define SCOPE_IO_FFLUSH(stream) do { } while (0)
+#endif
+
+#if SCOPE_PROXY_LOG_ENABLE && SCOPE_PROXY_LOG_INTX && SCOPE_PROXY_LOG_FLUSH
+#define SCOPE_INTX_FFLUSH(stream) fflush(stream)
+#else
+#define SCOPE_INTX_FFLUSH(stream) do { } while (0)
 #endif
 
 typedef struct ScopeVswitchConfigFn {
@@ -229,9 +250,11 @@ typedef struct ScopePendingDoorbell {
 typedef enum ScopeBackendType {
     SCOPE_BACKEND_NVME = 0,
     SCOPE_BACKEND_IGB,
+    SCOPE_BACKEND_VORTEX,
 } ScopeBackendType;
 
 typedef struct ScopeIgbState ScopeIgbState;
+typedef struct ScopeVortexState ScopeVortexState;
 typedef struct ScopeBackendOps ScopeBackendOps;
 
 typedef struct ScopeBackend {
@@ -240,6 +263,7 @@ typedef struct ScopeBackend {
     uint8_t id;
     uint16_t virtual_bdf;
     char *real_host_bdf;
+    char *bridge_socket;
     int real_bar_fd;
     void *real_bar0_map;
     size_t real_bar0_size;
@@ -269,10 +293,12 @@ typedef struct ScopeBackend {
     bool intx_pending;
     int64_t last_pending_log_us;
     ScopeIgbState *igb;
+    ScopeVortexState *vortex;
 } ScopeBackend;
 
 struct ScopeBackendOps {
     const char *name;
+    bool requires_real_pci;
     bool (*preflight)(ScopeProxyState *s, Error **errp);
     bool (*realize)(ScopeProxyState *s, Error **errp);
     void (*cleanup)(ScopeProxyState *s, ScopeBackend *be);
@@ -283,6 +309,7 @@ struct ScopeBackendOps {
 
 static const ScopeBackendOps scope_nvme_backend_ops;
 static const ScopeBackendOps scope_igb_backend_ops;
+static const ScopeBackendOps scope_vortex_backend_ops;
 static bool scope_nvme_backend_realize(ScopeProxyState *s, Error **errp);
 static void scope_nvme_backend_cleanup(ScopeProxyState *s, ScopeBackend *be);
 static bool scope_recover_missing_bar_done(ScopeProxyState *s, int64_t now_us);
@@ -437,6 +464,7 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                                        Error **errp)
 {
     bool have_bdf = false;
+    bool have_socket = false;
     bool have_type = false;
 
     be->type = SCOPE_BACKEND_NVME;
@@ -467,6 +495,8 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                     be->type = SCOPE_BACKEND_NVME;
                 } else if (!strcmp(value, "igb")) {
                     be->type = SCOPE_BACKEND_IGB;
+                } else if (!strcmp(value, "vortex")) {
+                    be->type = SCOPE_BACKEND_VORTEX;
                 } else {
                     error_setg(errp, "backend config: unsupported device type '%s'",
                                value);
@@ -488,6 +518,20 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                 }
                 be->real_host_bdf = g_steal_pointer(&value);
                 have_bdf = true;
+            } else if (!strcmp(key, "bridge-socket")) {
+                if (have_socket) {
+                    error_setg(errp, "backend config: duplicate bridge-socket");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value || value[0] != '/') {
+                    if (!*errp) {
+                        error_setg(errp, "backend config: bridge-socket must be an absolute path");
+                    }
+                    return false;
+                }
+                be->bridge_socket = g_steal_pointer(&value);
+                have_socket = true;
             } else {
                 error_setg(errp, "backend config: unknown device key '%s'", key);
                 return false;
@@ -502,8 +546,12 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
             }
         }
     }
-    if (!have_bdf) {
-        error_setg(errp, "backend config: device is missing real-host-bdf");
+    if (be->type == SCOPE_BACKEND_VORTEX && (!have_socket || have_bdf)) {
+        error_setg(errp, "backend config: vortex requires bridge-socket and forbids real-host-bdf");
+        return false;
+    }
+    if (be->type != SCOPE_BACKEND_VORTEX && (!have_bdf || have_socket)) {
+        error_setg(errp, "backend config: nvme/igb require real-host-bdf and forbid bridge-socket");
         return false;
     }
     return true;
@@ -593,7 +641,9 @@ static bool scope_parse_backend_config(ScopeProxyState *s, Error **errp)
                 if (!scope_parse_backend_object(&j, &s->backends[s->backend_count], errp))
                     return false;
                 for (i = 0; i < s->backend_count; i++) {
-                    if (!strcmp(s->backends[i].real_host_bdf,
+                    if (s->backends[i].real_host_bdf &&
+                        s->backends[s->backend_count].real_host_bdf &&
+                        !strcmp(s->backends[i].real_host_bdf,
                                 s->backends[s->backend_count].real_host_bdf)) {
                         error_setg(errp, "backend config: duplicate BDF %s",
                                    s->backends[i].real_host_bdf);
@@ -1054,13 +1104,13 @@ static bool scope_virtual_rp_set_intx(ScopeProxyState *s, bool level)
     }
 
     read_ok = scope_read_rp_intx_regs(s, &rp_status, &rp_count);
-    SCOPE_PRINTF("[SCOPE PROXY][INTX][SET] old_level=%d new_level=%d "
+    SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX][SET] old_level=%d new_level=%d "
            "write_ok=%d read_ok=%d assert_count=%" PRIu64
            " deassert_count=%" PRIu64 " rp_status=0x%08x rp_count=%u\n",
            old_level, level, ok, read_ok,
            s->virtual_intx_assert_count, s->virtual_intx_deassert_count,
            rp_status, rp_count);
-    SCOPE_FFLUSH(stdout);
+    SCOPE_INTX_FFLUSH(stdout);
 
     return ok;
 }
@@ -1082,11 +1132,11 @@ static void scope_virtual_rp_retry_intx_pulse(ScopeProxyState *s)
 
     s->virtual_intx_retry_count++;
     s->virtual_intx_last_retry_us = now_us;
-    SCOPE_PRINTF("[SCOPE PROXY][INTX][RETRY_PULSE] count=%" PRIu64
+    SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX][RETRY_PULSE] count=%" PRIu64
            " interval_us=%u low_us=%u\n",
            s->virtual_intx_retry_count, SCOPE_INTX_RETRY_INTERVAL_US,
            SCOPE_INTX_RETRY_LOW_US);
-    SCOPE_FFLUSH(stdout);
+    SCOPE_INTX_FFLUSH(stdout);
 
     if (scope_virtual_rp_set_intx(s, false)) {
         if (SCOPE_INTX_RETRY_LOW_US) {
@@ -1286,6 +1336,40 @@ static void scope_vcfg_init_igb_endpoint(ScopeVswitchConfigFn *fn,
     scope_vcfg_w1c_range(fn, pcie_cap + PCI_EXP_DEVSTA, 2);
 }
 
+static void scope_vcfg_init_vortex_endpoint(ScopeVswitchConfigFn *fn,
+                                            uint16_t bdf)
+{
+    const uint8_t pcie_cap = 0x70;
+
+    memset(fn, 0, sizeof(*fn));
+    fn->bdf = bdf;
+    pci_config_set_vendor_id(fn->config, 0x1b36);
+    pci_config_set_device_id(fn->config, 0x1310);
+    pci_config_set_class(fn->config, SCOPE_VORTEX_PCI_CLASS);
+    fn->config[PCI_CLASS_PROG] = 0;
+    fn->config[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL;
+    fn->config[PCI_INTERRUPT_LINE] = 0xff;
+    fn->config[PCI_INTERRUPT_PIN] = 0;
+    pci_set_word(fn->config + PCI_STATUS, PCI_STATUS_CAP_LIST);
+    fn->config[PCI_CAPABILITY_LIST] = pcie_cap;
+    fn->config[pcie_cap + PCI_CAP_LIST_ID] = PCI_CAP_ID_EXP;
+    pci_set_word(fn->config + pcie_cap + PCI_EXP_FLAGS,
+                 PCI_EXP_FLAGS_VER2 | (PCI_EXP_TYPE_ENDPOINT << 4));
+    pci_set_long(fn->config + pcie_cap + PCI_EXP_LNKCAP,
+                 PCI_EXP_LNKCAP_SLS_2_5GB |
+                 QEMU_PCI_EXP_LNKCAP_MLW(QEMU_PCI_EXP_LNK_X1));
+    pci_set_word(fn->config + pcie_cap + PCI_EXP_LNKSTA,
+                 PCI_EXP_LNKSTA_CLS_2_5GB |
+                 QEMU_PCI_EXP_LNKSTA_NLW(QEMU_PCI_EXP_LNK_X1));
+
+    scope_vcfg_allow_range(fn, PCI_COMMAND, 2);
+    scope_vcfg_w1c_range(fn, PCI_STATUS, 2);
+    pci_set_long(fn->wmask + PCI_BASE_ADDRESS_0,
+                 ~(SCOPE_VORTEX_BAR0_SIZE - 1U) & PCI_BASE_ADDRESS_MEM_MASK);
+    scope_vcfg_allow_range(fn, pcie_cap + PCI_EXP_DEVCTL, 2);
+    scope_vcfg_w1c_range(fn, pcie_cap + PCI_EXP_DEVSTA, 2);
+}
+
 static void scope_vcfg_init_all(ScopeProxyState *s, PCIDevice *pci_dev)
 {
     unsigned int i;
@@ -1308,6 +1392,8 @@ static void scope_vcfg_init_all(ScopeProxyState *s, PCIDevice *pci_dev)
         if (be->type == SCOPE_BACKEND_IGB) {
             scope_vcfg_init_igb_endpoint(ep, SCOPE_VSWITCH_EP_BDF(i),
                                          be->real_bar0_size);
+        } else if (be->type == SCOPE_BACKEND_VORTEX) {
+            scope_vcfg_init_vortex_endpoint(ep, SCOPE_VSWITCH_EP_BDF(i));
         } else {
             memset(ep, 0, sizeof(*ep));
             ep->bdf = SCOPE_VSWITCH_EP_BDF(i);
@@ -3602,16 +3688,16 @@ static void scope_update_virtual_intx(ScopeProxyState *s)
     if (pending && (!old_level || new_completion)) {
         if (scope_virtual_rp_set_intx(s, true)) {
             if (!old_level) {
-                SCOPE_PRINTF("[SCOPE PROXY][INTX] assert pending completion(s) detected\n");
+                SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX] assert pending completion(s) detected\n");
             } else {
-                SCOPE_PRINTF("[SCOPE PROXY][INTX] refresh asserted level for new completion\n");
+                SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX] refresh asserted level for new completion\n");
             }
-            SCOPE_FFLUSH(stdout);
+            SCOPE_INTX_FFLUSH(stdout);
         }
     } else if (!pending && s->virtual_intx_level) {
         if (scope_virtual_rp_set_intx(s, false)) {
-            SCOPE_PRINTF("[SCOPE PROXY][INTX] deassert no pending completion\n");
-            SCOPE_FFLUSH(stdout);
+            SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX] deassert no pending completion\n");
+            SCOPE_INTX_FFLUSH(stdout);
         }
     } else if (pending && s->virtual_intx_level) {
         scope_virtual_rp_retry_intx_pulse(s);
@@ -4052,6 +4138,7 @@ static bool scope_handle_nvme_bar_read(ScopeProxyState *s, uint32_t offset, uint
 }
 
 #include "scope_fpga_vswitch_nvme_backend.c"
+#include "scope_fpga_vswitch_vortex_backend.c"
 
 static bool scope_read_stable_packet(const void *slot_base,
                                      struct scope_dma32_packet *pkt)
@@ -4615,6 +4702,7 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
             g_free(be->pending_admin_ops);
             if (be->ns_lba_shift_map) g_hash_table_destroy(be->ns_lba_shift_map);
             g_free(be->real_host_bdf);
+            g_free(be->bridge_socket);
         }
     }
     if (s->xdma_bypass_fd >= 0) {
@@ -4667,8 +4755,13 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
         be->id = i;
         be->virtual_bdf = SCOPE_VSWITCH_EP_BDF(i);
         be->real_bar_fd = -1;
-        be->ops = be->type == SCOPE_BACKEND_IGB ?
-                  &scope_igb_backend_ops : &scope_nvme_backend_ops;
+        if (be->type == SCOPE_BACKEND_IGB) {
+            be->ops = &scope_igb_backend_ops;
+        } else if (be->type == SCOPE_BACKEND_VORTEX) {
+            be->ops = &scope_vortex_backend_ops;
+        } else {
+            be->ops = &scope_nvme_backend_ops;
+        }
         if (be->type == SCOPE_BACKEND_NVME) {
             be->ctrl_page_size = SCOPE_NVME_DEFAULT_CTRL_PAGE_SIZE;
             be->ns_lba_shift_map = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -4690,11 +4783,18 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     }
     for (i = 0; i < s->backend_count; i++) {
         s->active = &s->backends[i];
-        if ((s->active->ops->preflight &&
-             !s->active->ops->preflight(s, errp)) ||
-            !scope_enable_real_pci_bus_master(s, errp) ||
-            !scope_parse_real_bar0(s, errp)) {
+        if (s->active->ops->preflight &&
+            !s->active->ops->preflight(s, errp)) {
             goto fail;
+        }
+        if (s->active->ops->requires_real_pci) {
+            if (!scope_enable_real_pci_bus_master(s, errp) ||
+                !scope_parse_real_bar0(s, errp)) {
+                goto fail;
+            }
+        } else {
+            s->active->real_bar0_size = SCOPE_VORTEX_BAR0_SIZE;
+            s->active->real_bar0_flags = IORESOURCE_MEM;
         }
         if (!s->active->ops || !s->active->ops->realize ||
             !s->active->ops->realize(s, errp)) {
@@ -4795,9 +4895,10 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     SCOPE_PRINTF("[SCOPE PROXY] Active backends=%u\n", s->backend_count);
     for (i = 0; i < s->backend_count; i++)
         SCOPE_PRINTF("[SCOPE PROXY] backend=%u type=%s virtual=%02x:00.0 "
-                     "real=%s BAR0=0x%zx\n",
+                     "transport=%s BAR0=0x%zx\n",
                      i, s->backends[i].ops->name,
-                     3 + i, s->backends[i].real_host_bdf,
+                     3 + i, s->backends[i].real_host_bdf ?
+                     s->backends[i].real_host_bdf : s->backends[i].bridge_socket,
                      s->backends[i].real_bar0_size);
     SCOPE_PRINTF("[SCOPE PROXY] FPGA bypass BAR%d @ 0x%016" PRIx64 ", size=0x%016" PRIx64 "\n",
            s->fpga_bypass_bar_index, s->fpga_bypass_bar_base, s->fpga_bypass_bar_size);
