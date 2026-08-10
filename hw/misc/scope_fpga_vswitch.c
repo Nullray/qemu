@@ -25,8 +25,16 @@
 OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 
 #define HOST_MBX_BASE           0x01000000U
+#define HOST_INTX_E2E_BASE      0x01002000U
 #define HOST_ECAM_SHADOW_BASE   0x01010000U
 #define HOST_ECAM_SHADOW_SIZE   0x00020000U
+
+#define INTX_E2E_REG_CQ_BASE_LO 0x20U
+#define INTX_E2E_REG_CQ_BASE_HI 0x24U
+#define INTX_E2E_REG_CQ_SIZE    0x28U
+#define INTX_E2E_REG_SELECT     0x2cU
+#define INTX_E2E_SELECT_VALID   (1U << 31)
+#define INTX_E2E_SELECT_QID_SHIFT 8U
 
 #define MBX_REG_ACK               0x10U
 #define MBX_REG_PROXY_CTRL        0x30U
@@ -366,6 +374,9 @@ struct ScopeProxyState {
     uint64_t virtual_intx_retry_count;
     int64_t virtual_intx_last_retry_us;
     bool intx_retry_pulse;
+    bool intx_e2e_enable;
+    uint32_t intx_e2e_backend;
+    uint32_t intx_e2e_qid;
 
     MemoryRegion dummy_bar0;
 };
@@ -2414,6 +2425,89 @@ static ScopeSqeReadStatus scope_read_admin_sqe_stable(ScopeProxyState *s,
            SCOPE_SQE_READ_WAIT : SCOPE_SQE_READ_ERR;
 }
 
+static bool scope_sync_intx_e2e_cq_window(ScopeProxyState *s)
+{
+    ScopeBackend *be;
+    ScopeCqState *cq;
+    uint64_t alias_offset = 0;
+    uint64_t cq_bytes;
+    uint32_t select;
+    bool ok;
+
+    if (!s->intx_e2e_enable || s->xdma_fd < 0) {
+        return true;
+    }
+
+    qemu_mutex_lock(&s->xdma_lock);
+    ok = scope_xdma_write32_locked(s,
+                                   HOST_INTX_E2E_BASE +
+                                   INTX_E2E_REG_SELECT, 0);
+    qemu_mutex_unlock(&s->xdma_lock);
+    if (!ok) {
+        return false;
+    }
+
+    if (s->intx_e2e_backend >= s->backend_count ||
+        s->intx_e2e_qid >= SCOPE_MAX_NVME_QUEUES) {
+        return true;
+    }
+
+    be = &s->backends[s->intx_e2e_backend];
+    if (be->type != SCOPE_BACKEND_NVME) {
+        return true;
+    }
+    cq = &be->cq[s->intx_e2e_qid];
+    if (!cq->valid || !cq->depth || !cq->guest_base) {
+        return true;
+    }
+
+    cq_bytes = (uint64_t)cq->depth * sizeof(NvmeCqe);
+    if (cq_bytes > UINT32_MAX ||
+        !scope_guest_range_to_coherent_bar_offset(s, cq->guest_base,
+                                                   cq_bytes,
+                                                   &alias_offset)) {
+        return false;
+    }
+
+    select = INTX_E2E_SELECT_VALID |
+             ((s->intx_e2e_qid & 0xffffU) <<
+              INTX_E2E_SELECT_QID_SHIFT) |
+             (s->intx_e2e_backend & 0xffU);
+
+    /*
+     * SELECT.valid is the commit point.  The FPGA ignores the window while
+     * QEMU updates base and size, so the experiment cannot observe a
+     * partially reconfigured CQ range.
+     */
+    qemu_mutex_lock(&s->xdma_lock);
+    ok = scope_xdma_write32_locked(s,
+                                   HOST_INTX_E2E_BASE +
+                                   INTX_E2E_REG_CQ_BASE_LO,
+                                   (uint32_t)alias_offset) &&
+         scope_xdma_write32_locked(s,
+                                   HOST_INTX_E2E_BASE +
+                                   INTX_E2E_REG_CQ_BASE_HI,
+                                   (uint32_t)(alias_offset >> 32)) &&
+         scope_xdma_write32_locked(s,
+                                   HOST_INTX_E2E_BASE +
+                                   INTX_E2E_REG_CQ_SIZE,
+                                   (uint32_t)cq_bytes) &&
+         scope_xdma_write32_locked(s,
+                                   HOST_INTX_E2E_BASE +
+                                   INTX_E2E_REG_SELECT, select);
+    qemu_mutex_unlock(&s->xdma_lock);
+
+    if (ok) {
+        SCOPE_PRINTF("[SCOPE PROXY][INTX_E2E][CQ] backend=%u "
+                     "virtual=%02x:00.0 qid=%u guest=0x%016" PRIx64
+                     " alias=0x%016" PRIx64 " bytes=%" PRIu64 "\n",
+                     be->id, 3 + be->id, cq->qid, cq->guest_base,
+                     alias_offset, cq_bytes);
+        SCOPE_FFLUSH(stdout);
+    }
+    return ok;
+}
+
 static bool scope_refresh_admin_queue_state(ScopeProxyState *s)
 {
     uint64_t translated_asq = 0;
@@ -2424,8 +2518,9 @@ static bool scope_refresh_admin_queue_state(ScopeProxyState *s)
     memset(&s->active->sq[SCOPE_ADMIN_QID], 0, sizeof(s->active->sq[SCOPE_ADMIN_QID]));
     memset(&s->active->cq[SCOPE_ADMIN_QID], 0, sizeof(s->active->cq[SCOPE_ADMIN_QID]));
 
-    if (!s->active->guest_asq || !s->active->guest_acq || !sq_depth || !cq_depth) {
-        return true;
+    if (!s->active->guest_asq || !s->active->guest_acq ||
+        !sq_depth || !cq_depth) {
+        return scope_sync_intx_e2e_cq_window(s);
     }
     if (!scope_translate_guest_pa_for_real_dma(s, s->active->guest_asq, 1, &translated_asq) ||
         !scope_translate_guest_pa_for_real_dma(s, s->active->guest_acq, 1, &translated_acq)) {
@@ -2457,7 +2552,7 @@ static bool scope_refresh_admin_queue_state(ScopeProxyState *s)
 
     scope_capture_admin_seed(s);
 
-    return true;
+    return scope_sync_intx_e2e_cq_window(s);
 }
 
 static bool scope_sync_admin_regs_to_real(ScopeProxyState *s)
@@ -2528,7 +2623,7 @@ static bool scope_register_cq(ScopeProxyState *s, uint16_t qid, uint64_t guest_b
     s->active->cq[qid].phase = true;
     s->active->cq[qid].guest_base = guest_base;
     s->active->cq[qid].translated_base = translated;
-    return true;
+    return scope_sync_intx_e2e_cq_window(s);
 }
 
 static bool scope_register_sq(ScopeProxyState *s, uint16_t qid, uint16_t cqid,
@@ -3158,6 +3253,7 @@ static void scope_commit_pending_admin_op(ScopeProxyState *s, const NvmeCqe *cqe
         case SCOPE_ADMIN_TOPO_OP_DELETE_CQ:
             if (op->qid < SCOPE_MAX_NVME_QUEUES) {
                 memset(&s->active->cq[op->qid], 0, sizeof(s->active->cq[op->qid]));
+                ok = scope_sync_intx_e2e_cq_window(s);
             } else {
                 ok = false;
             }
@@ -4067,6 +4163,9 @@ static bool scope_handle_nvme_bar_write(ScopeProxyState *s, uint32_t offset, uin
 
         if (!NVME_CC_EN(s->active->guest_cc)) {
             scope_reset_all_queue_state(s);
+            if (!scope_sync_intx_e2e_cq_window(s)) {
+                return false;
+            }
             scope_update_virtual_intx(s);
         } else if (!NVME_CC_EN(old_cc)) {
             scope_reset_all_queue_state(s);
@@ -4677,6 +4776,15 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
         s->rx_thread_started = false;
     }
 
+    if (s->intx_e2e_enable && s->xdma_fd >= 0 &&
+        s->xdma_lock_inited) {
+        qemu_mutex_lock(&s->xdma_lock);
+        scope_xdma_write32_locked(s,
+                                  HOST_INTX_E2E_BASE +
+                                  INTX_E2E_REG_SELECT, 0);
+        qemu_mutex_unlock(&s->xdma_lock);
+    }
+
     if (s->dma32_db_map) {
         munmap(s->dma32_db_map, s->dma32_db.size);
         s->dma32_db_map = NULL;
@@ -4771,6 +4879,28 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     }
     s->active = s->backend_count ? &s->backends[0] : NULL;
 
+    if (s->intx_e2e_enable) {
+        if (s->intx_e2e_backend >= s->backend_count) {
+            error_setg(errp,
+                       "intx-e2e-backend=%u is outside active backend range "
+                       "[0,%u)",
+                       s->intx_e2e_backend, s->backend_count);
+            goto fail;
+        }
+        if (s->intx_e2e_qid >= SCOPE_MAX_NVME_QUEUES) {
+            error_setg(errp, "intx-e2e-qid=%u must be below %u",
+                       s->intx_e2e_qid, SCOPE_MAX_NVME_QUEUES);
+            goto fail;
+        }
+        if (s->backends[s->intx_e2e_backend].type !=
+            SCOPE_BACKEND_NVME) {
+            error_setg(errp,
+                       "intx-e2e-backend=%u is not an NVMe backend",
+                       s->intx_e2e_backend);
+            goto fail;
+        }
+    }
+
     host_page_size = sysconf(_SC_PAGESIZE);
     s->host_page_size = host_page_size > 0 ? host_page_size : 4096;
 
@@ -4806,6 +4936,10 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     s->xdma_fd = open(xdma_user_dev, O_RDWR | O_SYNC);
     if (s->xdma_fd < 0) {
         error_setg_errno(errp, errno, "Failed to open %s", xdma_user_dev);
+        goto fail;
+    }
+    if (!scope_sync_intx_e2e_cq_window(s)) {
+        error_setg(errp, "Failed to initialize INTx E2E CQ window");
         goto fail;
     }
     s->ecam_shadow_map = mmap(NULL, HOST_ECAM_SHADOW_SIZE, PROT_READ | PROT_WRITE,
@@ -4914,6 +5048,13 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     SCOPE_PRINTF("[SCOPE PROXY] Guest DDR base=0x%016" PRIx64 ", size=0x%016" PRIx64 "\n",
            s->guest_ddr_base, s->guest_ddr_size);
     SCOPE_PRINTF("[SCOPE PROXY] INTx-only virtual device, MSI/MSI-X disabled.\n");
+    if (s->intx_e2e_enable) {
+        SCOPE_PRINTF("[SCOPE PROXY] INTx E2E experiment enabled: "
+                     "backend=%u qid=%u host_regs=0x%08x "
+                     "dut_marker=0x60fff000 (reserved ECAM 0f:1f.7)\n",
+                     s->intx_e2e_backend, s->intx_e2e_qid,
+                     HOST_INTX_E2E_BASE);
+    }
     if (s->xdma_event_dev) {
         SCOPE_PRINTF("[SCOPE PROXY] xdma-event-dev=%s is accepted for command-line "
                "compatibility but ignored; CFG writes use DMA32 C2H packets.\n",
@@ -4968,6 +5109,9 @@ static void scope_proxy_instance_init(Object *obj)
     s->virtual_intx_retry_count = 0;
     s->virtual_intx_last_retry_us = 0;
     s->intx_retry_pulse = false;
+    s->intx_e2e_enable = false;
+    s->intx_e2e_backend = 0;
+    s->intx_e2e_qid = 1;
 }
 
 static const Property scope_proxy_properties[] = {
@@ -4991,6 +5135,12 @@ static const Property scope_proxy_properties[] = {
                      guest_mem_raw_fallback, false),
     DEFINE_PROP_BOOL("intx-retry-pulse", ScopeProxyState,
                      intx_retry_pulse, false),
+    DEFINE_PROP_BOOL("intx-e2e-enable", ScopeProxyState,
+                     intx_e2e_enable, false),
+    DEFINE_PROP_UINT32("intx-e2e-backend", ScopeProxyState,
+                       intx_e2e_backend, 0),
+    DEFINE_PROP_UINT32("intx-e2e-qid", ScopeProxyState,
+                       intx_e2e_qid, 1),
 };
 
 static void scope_proxy_class_init(ObjectClass *class, const void *data)
