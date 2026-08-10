@@ -171,4 +171,7 @@ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 system_ss.add(when: 'CONFIG_PCI', if_true: files('scope_fpga_proxy.c'))
 system_ss.add(when: 'CONFIG_PCI', if_true: files('scope_fpga_mmio_lat_test.c'))
 system_ss.add(when: 'CONFIG_PCI', if_true: files('scope_fpga_vswitch_nvme.c'))
-system_ss.add(when: 'CONFIG_PCI', if_true: files('scope_fpga_vswitch.c'))
+system_ss.add(when: 'CONFIG_PCI', if_true: files(
+  'scope_fpga_vswitch.c',
+  'scope_fpga_vswitch_irq_latency.c',
+))

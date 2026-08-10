@@ -8,9 +8,11 @@
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
+#include "qemu/timer.h"
 #include "block/nvme.h"
 #include "hw/net/igb_regs.h"
 #include "hw/misc/scope_fpga_vswitch_abi.h"
+#include "hw/misc/scope_fpga_vswitch_irq_latency.h"
 #include "hw/misc/scope_vortex_bridge_proto.h"
 
 #include <fcntl.h>
@@ -366,6 +368,13 @@ struct ScopeProxyState {
     uint64_t virtual_intx_retry_count;
     int64_t virtual_intx_last_retry_us;
     bool intx_retry_pulse;
+
+    bool irq_latency_test;
+    uint32_t irq_latency_backend_id;
+    uint32_t irq_latency_qid;
+    uint32_t irq_latency_samples;
+    char *irq_latency_output;
+    ScopeIrqLatencyState *irq_latency;
 
     MemoryRegion dummy_bar0;
 };
@@ -1082,15 +1091,23 @@ static bool scope_write_bar_response(ScopeProxyState *s, uint32_t seq, uint32_t 
 static bool scope_virtual_rp_set_intx(ScopeProxyState *s, bool level)
 {
     bool old_level = s->virtual_intx_level;
+    int64_t write_start_ns;
+    int64_t write_done_ns;
     uint32_t rp_status = 0;
     uint32_t rp_count = 0;
-    bool read_ok;
+    bool latency_waiting;
     bool ok;
 
+    write_start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     qemu_mutex_lock(&s->xdma_lock);
     ok = scope_xdma_write32_locked(s, HOST_MBX_BASE + MBX_REG_RP_INTX_CTRL,
                                    level ? 1U : 0U);
     qemu_mutex_unlock(&s->xdma_lock);
+    write_done_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+
+    scope_irq_latency_record_intx(s->irq_latency, old_level, level, ok,
+                                  write_start_ns, write_done_ns);
+    latency_waiting = scope_irq_latency_poll(s->irq_latency);
 
     if (ok) {
         s->virtual_intx_level = level;
@@ -1103,14 +1120,17 @@ static bool scope_virtual_rp_set_intx(ScopeProxyState *s, bool level)
         }
     }
 
-    read_ok = scope_read_rp_intx_regs(s, &rp_status, &rp_count);
-    SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX][SET] old_level=%d new_level=%d "
-           "write_ok=%d read_ok=%d assert_count=%" PRIu64
-           " deassert_count=%" PRIu64 " rp_status=0x%08x rp_count=%u\n",
-           old_level, level, ok, read_ok,
-           s->virtual_intx_assert_count, s->virtual_intx_deassert_count,
-           rp_status, rp_count);
-    SCOPE_INTX_FFLUSH(stdout);
+    if (!latency_waiting) {
+        bool read_ok = scope_read_rp_intx_regs(s, &rp_status, &rp_count);
+
+        SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX][SET] old_level=%d new_level=%d "
+               "write_ok=%d read_ok=%d assert_count=%" PRIu64
+               " deassert_count=%" PRIu64 " rp_status=0x%08x rp_count=%u\n",
+               old_level, level, ok, read_ok,
+               s->virtual_intx_assert_count, s->virtual_intx_deassert_count,
+               rp_status, rp_count);
+        SCOPE_INTX_FFLUSH(stdout);
+    }
 
     return ok;
 }
@@ -3592,12 +3612,16 @@ static bool scope_refresh_cq_shadow_tail(ScopeProxyState *s, ScopeCqState *cq,
             break;
         }
         if (!scope_cqe_phase_matches(&cqe, cq->phase)) {
+            scope_irq_latency_record_cqe_absent(s->irq_latency,
+                                                s->active->id, cq->qid);
             break;
         }
         if (cq->qid == SCOPE_ADMIN_QID &&
             !scope_admin_cqe_expected(s, cq, &cqe)) {
             break;
         }
+        scope_irq_latency_record_cqe(s->irq_latency, s->active->id, cq->qid,
+                                     le16_to_cpu(cqe.cid), cq->shadow_tail);
         if (cq->qid == SCOPE_ADMIN_QID) {
             SCOPE_PRINTF("[SCOPE PROXY][CQ][SEEN] backend=%u qid=%u tail=%u "
                    "phase=%u guest_pa=0x%016"
@@ -3687,12 +3711,14 @@ static void scope_update_virtual_intx(ScopeProxyState *s)
     old_level = s->virtual_intx_level;
     if (pending && (!old_level || new_completion)) {
         if (scope_virtual_rp_set_intx(s, true)) {
-            if (!old_level) {
-                SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX] assert pending completion(s) detected\n");
-            } else {
-                SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX] refresh asserted level for new completion\n");
+            if (!scope_irq_latency_sample_pending(s->irq_latency)) {
+                if (!old_level) {
+                    SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX] assert pending completion(s) detected\n");
+                } else {
+                    SCOPE_INTX_PRINTF("[SCOPE PROXY][INTX] refresh asserted level for new completion\n");
+                }
+                SCOPE_INTX_FFLUSH(stdout);
             }
-            SCOPE_INTX_FFLUSH(stdout);
         }
     } else if (!pending && s->virtual_intx_level) {
         if (scope_virtual_rp_set_intx(s, false)) {
@@ -4308,6 +4334,16 @@ static void scope_process_cfg_packet(ScopeProxyState *s, const struct scope_dma3
           (0xffffffffU >> ((4 - len) * 8));
     actual_addr = addr + (uint32_t)offset;
 
+    if (scope_irq_latency_handle_cfg_write(s->irq_latency, bdf, actual_addr,
+                                           len, wstrb, val)) {
+        if (!scope_ack_cfg_packet(s, pkt->seq)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SCOPE: Failed to ACK IRQ latency marker registration seq=%u\n",
+                          pkt->seq);
+        }
+        return;
+    }
+
     SCOPE_PRINTF("[SCOPE VSWITCH][CFG][WR] seq=%u bdf=%02x:%02x.%u "
                  "off=0x%03x len=%d wstrb=0x%x val=0x%08x\n",
                  pkt->seq, bdf >> 8, (bdf >> 3) & 0x1f, bdf & 0x7,
@@ -4433,6 +4469,7 @@ static void *scope_proxy_rx_thread(void *opaque)
                                            &ring_cursor) || progressed;
 
         qemu_mutex_lock(&s->state_lock);
+        progressed = scope_irq_latency_poll(s->irq_latency) || progressed;
         for (b = 0; b < s->backend_count; b++) {
             s->active = &s->backends[b];
             if (s->active->ops && s->active->ops->poll) {
@@ -4441,6 +4478,7 @@ static void *scope_proxy_rx_thread(void *opaque)
             }
         }
         scope_update_virtual_intx(s);
+        progressed = scope_irq_latency_poll(s->irq_latency) || progressed;
         qemu_mutex_unlock(&s->state_lock);
 
         if (!progressed) {
@@ -4677,6 +4715,9 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
         s->rx_thread_started = false;
     }
 
+    scope_irq_latency_destroy(s->irq_latency);
+    s->irq_latency = NULL;
+
     if (s->dma32_db_map) {
         munmap(s->dma32_db_map, s->dma32_db.size);
         s->dma32_db_map = NULL;
@@ -4771,6 +4812,30 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     }
     s->active = s->backend_count ? &s->backends[0] : NULL;
 
+    if (s->irq_latency_test) {
+        ScopeBackend *latency_backend;
+
+        if (s->irq_latency_backend_id >= s->backend_count) {
+            error_setg(errp, "irq-latency-backend-id=%u is outside active "
+                       "backend range [0, %u)",
+                       s->irq_latency_backend_id, s->backend_count);
+            goto fail;
+        }
+        latency_backend = &s->backends[s->irq_latency_backend_id];
+        if (latency_backend->type != SCOPE_BACKEND_NVME) {
+            error_setg(errp, "irq latency target backend %u is not NVMe",
+                       s->irq_latency_backend_id);
+            goto fail;
+        }
+        s->irq_latency = scope_irq_latency_create(
+            s->irq_latency_backend_id, s->irq_latency_qid,
+            latency_backend->virtual_bdf, s->irq_latency_samples,
+            s->irq_latency_output, errp);
+        if (!s->irq_latency) {
+            goto fail;
+        }
+    }
+
     host_page_size = sysconf(_SC_PAGESIZE);
     s->host_page_size = host_page_size > 0 ? host_page_size : 4096;
 
@@ -4825,6 +4890,12 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     s->xdma_bypass_fd = open(xdma_bypass_dev, O_RDWR | O_SYNC);
     if (s->xdma_bypass_fd < 0) {
         error_setg_errno(errp, errno, "Failed to open %s", xdma_bypass_dev);
+        goto fail;
+    }
+    if (!scope_irq_latency_set_coherent_transport(
+            s->irq_latency, s->xdma_bypass_fd, s->fpga_bypass_bar_size,
+            s->bypass_coherent_alias_base, s->guest_ddr_base,
+            s->guest_ddr_size, s->host_page_size, errp)) {
         goto fail;
     }
 
@@ -4914,6 +4985,19 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     SCOPE_PRINTF("[SCOPE PROXY] Guest DDR base=0x%016" PRIx64 ", size=0x%016" PRIx64 "\n",
            s->guest_ddr_base, s->guest_ddr_size);
     SCOPE_PRINTF("[SCOPE PROXY] INTx-only virtual device, MSI/MSI-X disabled.\n");
+    if (s->irq_latency) {
+        SCOPE_PRINTF("[SCOPE IRQ LAT] enabled backend=%u virtual=%02x:00.0 "
+                     "qid=%u samples=%u marker_transport=coherent-alias "
+                     "registration_offsets=0x%02x/0x%02x/0x%02x output=%s\n",
+                     s->irq_latency_backend_id,
+                     3 + s->irq_latency_backend_id,
+                     s->irq_latency_qid, s->irq_latency_samples,
+                     SCOPE_IRQ_LATENCY_MARKER_ADDR_LO_OFFSET,
+                     SCOPE_IRQ_LATENCY_MARKER_ADDR_HI_OFFSET,
+                     SCOPE_IRQ_LATENCY_MARKER_COMMIT_OFFSET,
+                     s->irq_latency_output ? s->irq_latency_output :
+                     "/tmp/scope_irq_latency.csv");
+    }
     if (s->xdma_event_dev) {
         SCOPE_PRINTF("[SCOPE PROXY] xdma-event-dev=%s is accepted for command-line "
                "compatibility but ignored; CFG writes use DMA32 C2H packets.\n",
@@ -4968,6 +5052,12 @@ static void scope_proxy_instance_init(Object *obj)
     s->virtual_intx_retry_count = 0;
     s->virtual_intx_last_retry_us = 0;
     s->intx_retry_pulse = false;
+    s->irq_latency_test = false;
+    s->irq_latency_backend_id = 0;
+    s->irq_latency_qid = 1;
+    s->irq_latency_samples = 10000;
+    s->irq_latency_output = NULL;
+    s->irq_latency = NULL;
 }
 
 static const Property scope_proxy_properties[] = {
@@ -4991,6 +5081,16 @@ static const Property scope_proxy_properties[] = {
                      guest_mem_raw_fallback, false),
     DEFINE_PROP_BOOL("intx-retry-pulse", ScopeProxyState,
                      intx_retry_pulse, false),
+    DEFINE_PROP_BOOL("irq-latency-test", ScopeProxyState,
+                     irq_latency_test, false),
+    DEFINE_PROP_UINT32("irq-latency-backend-id", ScopeProxyState,
+                       irq_latency_backend_id, 0),
+    DEFINE_PROP_UINT32("irq-latency-qid", ScopeProxyState,
+                       irq_latency_qid, 1),
+    DEFINE_PROP_UINT32("irq-latency-samples", ScopeProxyState,
+                       irq_latency_samples, 10000),
+    DEFINE_PROP_STRING("irq-latency-output", ScopeProxyState,
+                       irq_latency_output),
 };
 
 static void scope_proxy_class_init(ObjectClass *class, const void *data)

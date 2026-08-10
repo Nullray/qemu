@@ -19,6 +19,7 @@ Details about QEMU's various subsystems including how to add features to them.
    reset
    s390-cpu-topology
    s390-dasd-ipl
+   scope-fpga-vswitch-irq-latency
    tracing
    uefi-vars
    vfio-iommufd
