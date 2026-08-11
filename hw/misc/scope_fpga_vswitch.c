@@ -4735,6 +4735,7 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
 {
     ScopeProxyState *s = SCOPE_PROXY(pci_dev);
     uint32_t dummy_ack = 1;
+    uint32_t bar_resp_ctrl;
     const char *xdma_user_dev = s->xdma_user_dev ? s->xdma_user_dev : SCOPE_DEFAULT_XDMA_USER;
     const char *xdma_ctrl_dev = s->xdma_ctrl_dev ? s->xdma_ctrl_dev : SCOPE_DEFAULT_XDMA_CTRL;
     const char *xdma_bypass_dev = s->xdma_bypass_dev ? s->xdma_bypass_dev : SCOPE_DEFAULT_XDMA_BYPASS;
@@ -4808,6 +4809,25 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
         error_setg_errno(errp, errno, "Failed to open %s", xdma_user_dev);
         goto fail;
     }
+
+    /*
+     * The FPGA mailbox survives a QEMU restart unless PCIe PERST is asserted.
+     * Continue from its commit-toggle value so the first BAR response after an
+     * idle manager restart is observed as a new response by the FPGA.
+     */
+    qemu_mutex_lock(&s->xdma_lock);
+    if (!scope_xdma_read32_locked(s,
+                                  HOST_MBX_BASE + MBX_REG_BAR_RESP_CTRL,
+                                  &bar_resp_ctrl)) {
+        qemu_mutex_unlock(&s->xdma_lock);
+        error_setg_errno(errp, errno,
+                         "Failed to read FPGA BAR response toggle");
+        goto fail;
+    }
+    qemu_mutex_unlock(&s->xdma_lock);
+    s->bar_resp_toggle =
+        (bar_resp_ctrl >> BAR_RESP_CTRL_TOGGLE_SHIFT) & 1U;
+
     s->ecam_shadow_map = mmap(NULL, HOST_ECAM_SHADOW_SIZE, PROT_READ | PROT_WRITE,
                               MAP_SHARED, s->xdma_fd, HOST_ECAM_SHADOW_BASE);
     if (s->ecam_shadow_map == MAP_FAILED) {

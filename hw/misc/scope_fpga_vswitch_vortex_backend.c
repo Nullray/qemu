@@ -307,6 +307,7 @@ static bool scope_vortex_device_range_valid(ScopeVortexState *v,
     uint64_t banks = UINT64_C(1) << banks_log2;
     uint64_t bank_size;
     uint64_t total;
+    uint64_t aperture_addr;
 
     if (!len || bank_size_log2 >= 64U) {
         return false;
@@ -316,7 +317,20 @@ static bool scope_vortex_device_range_valid(ScopeVortexState *v,
         return false;
     }
     total = banks * bank_size;
-    return addr < total && len <= total - addr;
+
+    /*
+     * The RTL narrows a Vortex logical address to
+     * VX_CFG_PLATFORM_MEMORY_ADDR_WIDTH before driving m_axi_mem.  In the
+     * single-bank U280 image that width is 28 bits, so the conventional
+     * kernel VMA 0x80000000 reaches HBM offset 0.  Validate the same narrowed
+     * aperture here; checking the untruncated 64-bit VMA incorrectly rejects
+     * every kernel image linked at Vortex's standard high address.
+     *
+     * banks and bank_size are both powers of two, hence total is a power of
+     * two after the overflow check above.
+     */
+    aperture_addr = addr & (total - 1U);
+    return len <= total - aperture_addr;
 }
 
 static bool scope_vortex_patch_line(ScopeVortexState *v, uint8_t *line,
@@ -698,7 +712,10 @@ static void scope_vortex_process_bar_packet(
     ScopeVortexState *v = s->active->vortex;
     uint8_t size = SCOPE_VSWITCH_PKT_SIZE(pkt->flags);
     uint8_t wstrb = SCOPE_VSWITCH_PKT_WSTRB(pkt->flags);
-    uint32_t value = pkt->data;
+    uint8_t lane = pkt->bar_offset & 0x7U;
+    uint8_t full_wstrb = 0x0fU << lane;
+    uint64_t lane_data = ((uint64_t)pkt->guest_addr_lo << 32) | pkt->data;
+    uint32_t value = scope_extract_dword32(lane_data, pkt->bar_offset);
     bool ok = false;
 
     if (!v || size != 4 || (pkt->bar_offset & 3) ||
@@ -712,9 +729,12 @@ static void scope_vortex_process_bar_packet(
     if (pkt->type == SCOPE_PKT_TYPE_BAR_READ) {
         ok = scope_vortex_bar_read(v, pkt->bar_offset, &value);
         scope_write_bar_response(s, pkt->seq, ok ? 0 : 0x2U,
-                                 ok ? value : UINT64_MAX, true, false);
+                                 ok ? scope_pack_dword32_for_offset(
+                                          value, pkt->bar_offset) :
+                                      UINT64_MAX,
+                                 true, false);
     } else if (pkt->type == SCOPE_PKT_TYPE_BAR_WRITE) {
-        ok = wstrb == 0x0fU &&
+        ok = wstrb == full_wstrb &&
              scope_vortex_bar_write(v, pkt->bar_offset, value);
         scope_write_bar_response(s, pkt->seq, ok ? 0 : 0x2U,
                                  0, false, false);
