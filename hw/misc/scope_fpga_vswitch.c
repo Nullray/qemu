@@ -264,6 +264,7 @@ typedef struct ScopeBackend {
     uint16_t virtual_bdf;
     char *real_host_bdf;
     char *bridge_socket;
+    bool vortex_direct_p2p;
     int real_bar_fd;
     void *real_bar0_map;
     size_t real_bar0_size;
@@ -346,6 +347,7 @@ struct ScopeProxyState {
     uint64_t fpga_bypass_bar_size;
     uint64_t bypass_coherent_alias_base;
     bool guest_mem_raw_fallback;
+    bool vortex_log;
     int fpga_bypass_bar_index;
     uint32_t proxy_ctrl_shadow;
     ScopeVswitchConfigFn vcfg[SCOPE_VSWITCH_ECAM_FUNC_COUNT];
@@ -466,6 +468,7 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
     bool have_bdf = false;
     bool have_socket = false;
     bool have_type = false;
+    bool have_data_path = false;
 
     be->type = SCOPE_BACKEND_NVME;
 
@@ -518,6 +521,26 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                 }
                 be->real_host_bdf = g_steal_pointer(&value);
                 have_bdf = true;
+            } else if (!strcmp(key, "data-path")) {
+                if (have_data_path) {
+                    error_setg(errp, "backend config: duplicate data-path");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value) {
+                    return false;
+                }
+                if (!strcmp(value, "mediated")) {
+                    be->vortex_direct_p2p = false;
+                } else if (!strcmp(value, "direct-p2p")) {
+                    be->vortex_direct_p2p = true;
+                } else {
+                    error_setg(errp,
+                               "backend config: unsupported Vortex data-path '%s'",
+                               value);
+                    return false;
+                }
+                have_data_path = true;
             } else if (!strcmp(key, "bridge-socket")) {
                 if (have_socket) {
                     error_setg(errp, "backend config: duplicate bridge-socket");
@@ -545,6 +568,11 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                 return false;
             }
         }
+    }
+    if (have_data_path && be->type != SCOPE_BACKEND_VORTEX) {
+        error_setg(errp,
+                   "backend config: data-path is valid only for vortex");
+        return false;
     }
     if (be->type == SCOPE_BACKEND_VORTEX && (!have_socket || have_bdf)) {
         error_setg(errp, "backend config: vortex requires bridge-socket and forbids real-host-bdf");
@@ -4978,6 +5006,7 @@ static void scope_proxy_instance_init(Object *obj)
     s->fpga_bypass_bar_size = 0;
     s->bypass_coherent_alias_base = SCOPE_DEFAULT_BYPASS_COHERENT_ALIAS_BASE;
     s->guest_mem_raw_fallback = false;
+    s->vortex_log = false;
     s->fpga_bypass_bar_index = -1;
     s->guest_ddr_base = 0;
     s->guest_ddr_size = 0;
@@ -5009,6 +5038,8 @@ static const Property scope_proxy_properties[] = {
                        SCOPE_DEFAULT_BYPASS_COHERENT_ALIAS_BASE),
     DEFINE_PROP_BOOL("guest-mem-raw-fallback", ScopeProxyState,
                      guest_mem_raw_fallback, false),
+    DEFINE_PROP_BOOL("vortex-log", ScopeProxyState,
+                     vortex_log, false),
     DEFINE_PROP_BOOL("intx-retry-pulse", ScopeProxyState,
                      intx_retry_pulse, false),
 };

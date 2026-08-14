@@ -2,9 +2,10 @@
  * Vortex Command Processor backend for scope-fpga-vswitch.
  *
  * BAR0 is a virtual 4 KiB CP register file.  The guest owns a coherent
- * command ring in XiangShan DDR.  A dedicated worker translates host-memory
- * operands in each 64-byte command line into U280 XRT BO addresses and then
- * submits the patched line to the physical Vortex CP through the bridge RPC.
+ * command ring in XiangShan DDR.  A dedicated worker either stages payloads
+ * through XRT BOs (mediated compatibility mode), or maps a validated NM37
+ * BAR2 window and patches only the host operand (direct-P2P mode).  Control
+ * commands still reach the physical Vortex CP through the bridge RPC.
  */
 
 #define SCOPE_VX_CP_CTRL               0x000U
@@ -38,6 +39,12 @@
 #define SCOPE_VX_RPC_IO_CHUNK          (64U * 1024U)
 #define SCOPE_VX_RPC_SOCKET_TIMEOUT_SEC 5
 #define SCOPE_VX_GUEST_VISIBLE_TIMEOUT_US 5000000LL
+#define SCOPE_VX_PEER_SLOT_SIZE       (4ULL * 1024ULL * 1024ULL)
+#define SCOPE_VX_PEER_WINDOW_SIZE     (64ULL * 1024ULL * 1024ULL)
+#define SCOPE_VX_P2P_GUEST_DDR_BASE   UINT64_C(0x80000000)
+#define SCOPE_VX_P2P_GUEST_DDR_SIZE   UINT64_C(0x80000000)
+#define SCOPE_VX_P2P_ALIAS_OFFSET     UINT64_C(0x100000000)
+#define SCOPE_VX_P2P_BAR_INDEX        2
 
 #define SCOPE_VX_OP_NOP                0x00U
 #define SCOPE_VX_OP_MEM_WRITE          0x01U
@@ -105,7 +112,51 @@ struct ScopeVortexState {
     uint64_t physical_cmpl_addr;
     uint64_t physical_tail;
     uint32_t physical_seq;
+
+    bool direct_p2p;
+    struct scope_vortex_rpc_peer_caps peer_caps;
+    bool peer_window_valid;
+    uint64_t peer_window_guest_base;
+    uint64_t peer_generation;
+    uint64_t payload_cpu_bytes;
 };
+
+static const char *scope_vortex_opcode_name(uint8_t opcode)
+{
+    switch (opcode) {
+    case SCOPE_VX_OP_NOP: return "NOP";
+    case SCOPE_VX_OP_MEM_WRITE: return "MEM_WRITE";
+    case SCOPE_VX_OP_MEM_READ: return "MEM_READ";
+    case SCOPE_VX_OP_MEM_COPY: return "MEM_COPY";
+    case SCOPE_VX_OP_DCR_WRITE: return "DCR_WRITE";
+    case SCOPE_VX_OP_DCR_READ: return "DCR_READ";
+    case SCOPE_VX_OP_LAUNCH: return "LAUNCH";
+    case SCOPE_VX_OP_FENCE: return "FENCE";
+    case SCOPE_VX_OP_EVENT_SIGNAL: return "EVENT_SIGNAL";
+    case SCOPE_VX_OP_EVENT_WAIT: return "EVENT_WAIT";
+    case SCOPE_VX_OP_CACHE_FLUSH: return "CACHE_FLUSH";
+    case SCOPE_VX_OP_LAUNCH_QMD: return "LAUNCH_QMD";
+    case SCOPE_VX_OP_DRAW: return "DRAW";
+    default: return "UNKNOWN";
+    }
+}
+
+static void scope_vortex_trace(ScopeVortexState *v, const char *fmt, ...)
+    G_GNUC_PRINTF(2, 3);
+
+static void scope_vortex_trace(ScopeVortexState *v, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!v->manager->vortex_log) {
+        return;
+    }
+    fprintf(stderr, "[SCOPE VORTEX] backend=%u ", v->backend->id);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+}
 
 static bool scope_vortex_io_full(int fd, void *buf, size_t len, bool write_op)
 {
@@ -260,12 +311,47 @@ static bool scope_vortex_rpc_mem_read(ScopeVortexState *v, uint32_t handle,
     return true;
 }
 
+static bool scope_vortex_rpc_peer_caps(ScopeVortexState *v)
+{
+    return scope_vortex_rpc(v, SCOPE_VORTEX_RPC_PEER_CAPS, NULL, 0,
+                            &v->peer_caps, sizeof(v->peer_caps));
+}
+
+static bool scope_vortex_rpc_peer_map(
+    ScopeVortexState *v, const struct scope_vortex_rpc_peer_map_req *req,
+    struct scope_vortex_rpc_peer_map_rsp *rsp)
+{
+    return scope_vortex_rpc(v, SCOPE_VORTEX_RPC_PEER_MAP, req, sizeof(*req),
+                            rsp, sizeof(*rsp));
+}
+
+static bool scope_vortex_rpc_peer_unmap(ScopeVortexState *v)
+{
+    struct scope_vortex_rpc_peer_unmap req = {
+        .generation = v->peer_generation,
+    };
+
+    if (!v->peer_window_valid) {
+        return true;
+    }
+    if (!scope_vortex_rpc(v, SCOPE_VORTEX_RPC_PEER_UNMAP,
+                          &req, sizeof(req), NULL, 0)) {
+        return false;
+    }
+    v->peer_window_valid = false;
+    v->peer_generation = 0;
+    return true;
+}
+
 static bool scope_vortex_connect(ScopeVortexState *v, const char *path,
                                  Error **errp)
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     struct timeval timeout = { .tv_sec = SCOPE_VX_RPC_SOCKET_TIMEOUT_SEC };
-    uint32_t version = 0;
+    struct scope_vortex_rpc_hello_req hello_req = {
+        .flags = v->direct_p2p ? SCOPE_VORTEX_HELLO_DIRECT_P2P : 0,
+    };
+    struct scope_vortex_rpc_hello_rsp hello_rsp;
 
     if (strlen(path) >= sizeof(addr.sun_path)) {
         error_setg(errp, "Vortex bridge socket path is too long");
@@ -289,9 +375,12 @@ static bool scope_vortex_connect(ScopeVortexState *v, const char *path,
                          "cannot set Vortex bridge socket timeout");
         return false;
     }
-    if (!scope_vortex_rpc(v, SCOPE_VORTEX_RPC_HELLO, NULL, 0,
-                          &version, sizeof(version)) ||
-        version != SCOPE_VORTEX_RPC_VERSION) {
+    if (!scope_vortex_rpc(v, SCOPE_VORTEX_RPC_HELLO,
+                          &hello_req, sizeof(hello_req),
+                          &hello_rsp, sizeof(hello_rsp)) ||
+        hello_rsp.version != SCOPE_VORTEX_RPC_VERSION ||
+        (v->direct_p2p &&
+         !(hello_rsp.capabilities & SCOPE_VORTEX_RPC_CAP_PEER_MAP))) {
         error_setg(errp, "Vortex bridge protocol handshake failed");
         return false;
     }
@@ -331,6 +420,184 @@ static bool scope_vortex_device_range_valid(ScopeVortexState *v,
      */
     aperture_addr = addr & (total - 1U);
     return len <= total - aperture_addr;
+}
+
+static bool scope_vortex_parse_host_bdf(const char *text, uint16_t *domain,
+                                        uint8_t *bus, uint8_t *devfn)
+{
+    unsigned int dom;
+    unsigned int b;
+    unsigned int dev;
+    unsigned int fn;
+    char tail;
+
+    if (!text || sscanf(text, "%x:%x:%x.%x%c", &dom, &b, &dev, &fn,
+                        &tail) != 4 || dom > UINT16_MAX || b > UINT8_MAX ||
+        dev > 31U || fn > 7U) {
+        return false;
+    }
+    *domain = dom;
+    *bus = b;
+    *devfn = (dev << 3) | fn;
+    return true;
+}
+
+static bool scope_vortex_validate_nonmem_line(ScopeVortexState *v,
+                                               const uint8_t *line)
+{
+    uint8_t opcode = line[0];
+    uint8_t flags = line[1];
+    uint64_t size;
+
+    if (flags & SCOPE_VX_FLAG_PROFILE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE VORTEX: profiled CP commands are not supported\n");
+        return false;
+    }
+    switch (opcode) {
+    case SCOPE_VX_OP_NOP:
+    case SCOPE_VX_OP_DCR_WRITE:
+    case SCOPE_VX_OP_DCR_READ:
+    case SCOPE_VX_OP_LAUNCH:
+    case SCOPE_VX_OP_FENCE:
+    case SCOPE_VX_OP_CACHE_FLUSH:
+        return true;
+    case SCOPE_VX_OP_MEM_COPY:
+        size = ldq_le_p(line + 20);
+        return scope_vortex_device_range_valid(v, ldq_le_p(line + 4), size) &&
+               scope_vortex_device_range_valid(v, ldq_le_p(line + 12), size);
+    case SCOPE_VX_OP_EVENT_SIGNAL:
+    case SCOPE_VX_OP_EVENT_WAIT:
+    case SCOPE_VX_OP_LAUNCH_QMD:
+    case SCOPE_VX_OP_DRAW:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE VORTEX: physical RTL CP does not support opcode 0x%02x\n",
+                      opcode);
+        return false;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE VORTEX: invalid direct-P2P opcode 0x%02x\n",
+                      opcode);
+        return false;
+    }
+}
+
+static bool scope_vortex_map_peer_window(ScopeVortexState *v, uint8_t opcode,
+                                         uint64_t guest_pa, uint64_t size,
+                                         uint64_t *cp_addr)
+{
+    ScopeProxyState *s = v->manager;
+    struct scope_vortex_rpc_peer_map_req req = { 0 };
+    struct scope_vortex_rpc_peer_map_rsp rsp;
+    uint64_t rounded;
+    uint64_t guest_end;
+    uint64_t window_guest_base;
+    uint64_t bar_offset;
+    uint64_t peer_target;
+    int64_t map_started_us;
+    uint16_t domain;
+    uint8_t bus;
+    uint8_t devfn;
+
+    if (!size || size > SCOPE_VORTEX_RPC_MAX_PAYLOAD ||
+        size > UINT64_MAX - (SCOPE_VX_CP_CL_SIZE - 1U)) {
+        return false;
+    }
+    rounded = ROUND_UP(size, SCOPE_VX_CP_CL_SIZE);
+    if (!scope_guest_pa_in_ddr_window(s, guest_pa, rounded) ||
+        s->guest_ddr_base > UINT64_MAX - s->guest_ddr_size) {
+        return false;
+    }
+    guest_end = s->guest_ddr_base + s->guest_ddr_size;
+    if (s->guest_ddr_size < SCOPE_VX_PEER_WINDOW_SIZE) {
+        return false;
+    }
+    window_guest_base = QEMU_ALIGN_DOWN(guest_pa, SCOPE_VX_PEER_SLOT_SIZE);
+    if (window_guest_base > guest_end - SCOPE_VX_PEER_WINDOW_SIZE) {
+        window_guest_base = guest_end - SCOPE_VX_PEER_WINDOW_SIZE;
+    }
+    if (guest_pa < window_guest_base ||
+        rounded > SCOPE_VX_PEER_WINDOW_SIZE - (guest_pa - window_guest_base) ||
+        !scope_guest_range_to_coherent_bar_offset(
+            s, window_guest_base, SCOPE_VX_PEER_WINDOW_SIZE, &bar_offset) ||
+        !scope_translate_guest_pa_for_real_dma(s, guest_pa, rounded,
+                                               &peer_target)) {
+        return false;
+    }
+
+    if (!v->peer_window_valid ||
+        v->peer_window_guest_base != window_guest_base) {
+        if (!scope_vortex_parse_host_bdf(s->fpga_host_bdf, &domain,
+                                         &bus, &devfn) ||
+            s->fpga_bypass_bar_index < 0 ||
+            s->fpga_bypass_bar_index > UINT8_MAX) {
+            return false;
+        }
+        req.domain = domain;
+        req.bus = bus;
+        req.devfn = devfn;
+        req.bar = s->fpga_bypass_bar_index;
+        req.bar_offset = bar_offset;
+        req.window_size = SCOPE_VX_PEER_WINDOW_SIZE;
+        map_started_us = g_get_monotonic_time();
+        if (!scope_vortex_rpc_peer_map(v, &req, &rsp) ||
+            rsp.cp_peer_base != v->peer_caps.peer_base ||
+            rsp.window_size != SCOPE_VX_PEER_WINDOW_SIZE ||
+            rsp.slot_size != SCOPE_VX_PEER_SLOT_SIZE || !rsp.generation) {
+            return false;
+        }
+        v->peer_window_valid = true;
+        v->peer_window_guest_base = window_guest_base;
+        v->peer_generation = rsp.generation;
+        scope_vortex_trace(v,
+                           "path=direct-p2p peer-map window_guest_base=0x%" PRIx64
+                           " bar_offset=0x%" PRIx64 " generation=%" PRIu64
+                           " map_latency_us=%" PRId64 "\n",
+                           window_guest_base, bar_offset, rsp.generation,
+                           g_get_monotonic_time() - map_started_us);
+    }
+
+    *cp_addr = v->peer_caps.peer_base + guest_pa - window_guest_base;
+    scope_vortex_trace(v,
+                       "path=direct-p2p direction=%s guest_pa=0x%" PRIx64
+                       " bar_offset=0x%" PRIx64 " peer_target=0x%" PRIx64
+                       " window_guest_base=0x%" PRIx64
+                       " cp_peer_addr=0x%" PRIx64 " generation=%" PRIu64
+                       " bytes=%" PRIu64 " payload_cpu_bytes=0\n",
+                       opcode == SCOPE_VX_OP_MEM_WRITE ? "PCIe-MRd" : "PCIe-MWr",
+                       guest_pa,
+                       bar_offset + guest_pa - window_guest_base,
+                       peer_target, window_guest_base, *cp_addr,
+                       v->peer_generation, size);
+    return true;
+}
+
+static bool scope_vortex_patch_direct_mem(ScopeVortexState *v, uint8_t *line)
+{
+    uint8_t opcode = line[0];
+    uint64_t guest_pa;
+    uint64_t device_addr;
+    uint64_t size;
+    uint64_t rounded;
+    uint64_t cp_addr;
+
+    if ((opcode != SCOPE_VX_OP_MEM_WRITE && opcode != SCOPE_VX_OP_MEM_READ) ||
+        (line[1] & SCOPE_VX_FLAG_PROFILE)) {
+        return false;
+    }
+    guest_pa = ldq_le_p(line + (opcode == SCOPE_VX_OP_MEM_WRITE ? 12 : 4));
+    device_addr = ldq_le_p(line + (opcode == SCOPE_VX_OP_MEM_WRITE ? 4 : 12));
+    size = ldq_le_p(line + 20);
+    if (!size || size > UINT64_MAX - (SCOPE_VX_CP_CL_SIZE - 1U)) {
+        return false;
+    }
+    rounded = ROUND_UP(size, SCOPE_VX_CP_CL_SIZE);
+    if (!scope_vortex_device_range_valid(v, device_addr, rounded) ||
+        !scope_vortex_map_peer_window(v, opcode, guest_pa, size, &cp_addr)) {
+        return false;
+    }
+    stq_le_p(line + (opcode == SCOPE_VX_OP_MEM_WRITE ? 12 : 4), cp_addr);
+    return true;
 }
 
 static bool scope_vortex_patch_line(ScopeVortexState *v, uint8_t *line,
@@ -379,8 +646,14 @@ static bool scope_vortex_patch_line(ScopeVortexState *v, uint8_t *line,
                 xfer->handle = 0;
                 return false;
             }
+            v->payload_cpu_bytes += xfer->size;
         }
         stq_le_p(line + (xfer->download ? 4 : 12), xfer->cp_addr);
+        scope_vortex_trace(v,
+                           "%s guest_pa=0x%" PRIx64
+                           " device=0x%" PRIx64 " bytes=%u xrt_cp=0x%" PRIx64 "\n",
+                           xfer->download ? "download" : "upload",
+                           guest_pa, device_addr, xfer->size, xfer->cp_addr);
         return true;
     case SCOPE_VX_OP_EVENT_SIGNAL:
     case SCOPE_VX_OP_EVENT_WAIT:
@@ -428,11 +701,13 @@ static bool scope_vortex_finish_transfer(ScopeVortexState *v,
                                        xfer->size) &&
              scope_guest_mem_write(v->manager, xfer->guest_pa, payload,
                                    xfer->size);
+        v->payload_cpu_bytes += xfer->size;
     }
     return scope_vortex_rpc_free(v, xfer->handle) && ok;
 }
 
-static bool scope_vortex_execute_job(ScopeVortexState *v, ScopeVortexJob *job)
+static bool scope_vortex_execute_job_mediated(ScopeVortexState *v,
+                                              ScopeVortexJob *job)
 {
     g_autofree ScopeVortexTransfer *xfers =
         g_new0(ScopeVortexTransfer, job->line_count);
@@ -442,15 +717,29 @@ static bool scope_vortex_execute_job(ScopeVortexState *v, ScopeVortexJob *job)
     uint32_t cycle_hi = 0;
     uint32_t last_dcr_rsp = 0;
     int64_t deadline;
+    int64_t started_us = g_get_monotonic_time();
     uint64_t new_tail = v->physical_tail;
     bool cycle_valid = false;
     bool last_dcr_valid = false;
     bool ok = true;
 
+    scope_vortex_trace(v,
+                       "job start guest_tail=0x%" PRIx64
+                       " lines=%u virtual_target=%u physical_seq=%u\n",
+                       job->guest_tail, job->line_count, job->target_seq,
+                       v->physical_seq);
+
     for (i = 0; i < job->line_count; i++) {
         uint8_t *line = job->lines + i * SCOPE_VX_CP_CL_SIZE;
         uint64_t ring_off = new_tail & (SCOPE_VX_CP_RING_SIZE - 1U);
+        uint8_t opcode = line[0];
 
+        scope_vortex_trace(v,
+                           "cmd=%u op=%s(0x%02x) arg0=0x%" PRIx64
+                           " arg1=0x%" PRIx64 " arg2=0x%" PRIx64 "\n",
+                           i, scope_vortex_opcode_name(opcode), opcode,
+                           ldq_le_p(line + 4), ldq_le_p(line + 12),
+                           ldq_le_p(line + 20));
         if (!scope_vortex_patch_line(v, line, &xfers[i]) ||
             !scope_vortex_rpc_mem_write(v, v->physical_ring_handle, ring_off,
                                         line, SCOPE_VX_CP_CL_SIZE)) {
@@ -521,7 +810,247 @@ static bool scope_vortex_execute_job(ScopeVortexState *v, ScopeVortexJob *job)
     /* Advance on error as well so userspace observes failure instead of hanging. */
     v->retired_seq = job->target_seq;
     qemu_mutex_unlock(&v->manager->state_lock);
+    if (cycle_valid) {
+        scope_vortex_trace(v,
+                           "job %s virtual_seq=%u physical_seq=%u cycles=%" PRIu64
+                           " elapsed_us=%" PRId64 "\n",
+                           ok ? "done" : "failed", job->target_seq,
+                           v->physical_seq,
+                           (uint64_t)cycle_lo | ((uint64_t)cycle_hi << 32),
+                           g_get_monotonic_time() - started_us);
+    } else {
+        scope_vortex_trace(v,
+                           "job %s virtual_seq=%u physical_seq=%u elapsed_us=%"
+                           PRId64 "\n",
+                           ok ? "done" : "failed", job->target_seq,
+                           v->physical_seq,
+                           g_get_monotonic_time() - started_us);
+    }
     return ok;
+}
+
+static bool scope_vortex_submit_physical(ScopeVortexState *v,
+                                          const uint8_t *lines,
+                                          uint32_t line_count)
+{
+    uint64_t new_tail = v->physical_tail;
+    uint32_t target;
+    uint32_t i;
+    uint32_t q_error = 0;
+    int64_t deadline;
+    int64_t started_us = g_get_monotonic_time();
+    bool ok = true;
+
+    if (!line_count) {
+        return true;
+    }
+    for (i = 0; i < line_count; i++) {
+        uint64_t ring_off = new_tail & (SCOPE_VX_CP_RING_SIZE - 1U);
+
+        if (!scope_vortex_rpc_mem_write(v, v->physical_ring_handle, ring_off,
+                                        lines + i * SCOPE_VX_CP_CL_SIZE,
+                                        SCOPE_VX_CP_CL_SIZE)) {
+            return false;
+        }
+        new_tail += SCOPE_VX_CP_CL_SIZE;
+    }
+
+    target = v->physical_seq + line_count;
+    if (!scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_Q_TAIL_LO,
+                                   (uint32_t)new_tail) ||
+        !scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_Q_TAIL_HI,
+                                   (uint32_t)(new_tail >> 32))) {
+        return false;
+    }
+    v->physical_tail = new_tail;
+    deadline = g_get_monotonic_time() + SCOPE_VX_CP_TIMEOUT_US;
+    while (!qatomic_read(&v->worker_stop)) {
+        uint32_t seq = 0;
+
+        ok = scope_vortex_rpc_cp_read(v, SCOPE_VX_CP_Q_SEQNUM, &seq);
+        if (!ok) {
+            break;
+        }
+        if ((int32_t)(seq - target) >= 0) {
+            v->physical_seq = seq;
+            break;
+        }
+        if (g_get_monotonic_time() >= deadline) {
+            ok = false;
+            break;
+        }
+        g_usleep(SCOPE_VX_CP_POLL_US);
+    }
+    if (qatomic_read(&v->worker_stop)) {
+        ok = false;
+    }
+    if (ok) {
+        ok = scope_vortex_rpc_cp_read(v, SCOPE_VX_CP_Q_ERROR, &q_error) &&
+             q_error == 0;
+    }
+    scope_vortex_trace(v,
+                       "path=direct-p2p physical_batch=%u physical_seq=%u"
+                       " q_error=%u command_latency_us=%" PRId64 "\n",
+                       line_count, v->physical_seq, q_error,
+                       g_get_monotonic_time() - started_us);
+    return ok;
+}
+
+static void scope_vortex_retire_direct(ScopeVortexState *v,
+                                       uint32_t virtual_seq)
+{
+    qemu_mutex_lock(&v->manager->state_lock);
+    v->retired_seq = virtual_seq;
+    qemu_mutex_unlock(&v->manager->state_lock);
+}
+
+static void scope_vortex_fail_direct(ScopeVortexState *v,
+                                     ScopeVortexJob *job)
+{
+    scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_CTRL, 0);
+    scope_vortex_rpc_peer_unmap(v);
+    scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_Q_CONTROL, 2);
+    scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_CTRL, 2);
+
+    qemu_mutex_lock(&v->manager->state_lock);
+    v->q_error = 1;
+    v->failed = true;
+    /* A failed virtual command retires with Q_ERROR instead of hanging. */
+    v->retired_seq = job->target_seq;
+    qemu_mutex_unlock(&v->manager->state_lock);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "SCOPE VORTEX: backend=%u direct-P2P job failed at "
+                  "guest tail=0x%" PRIx64 "\n",
+                  v->backend->id, job->guest_tail);
+}
+
+static bool scope_vortex_execute_job_direct(ScopeVortexState *v,
+                                            ScopeVortexJob *job)
+{
+    uint32_t virtual_base = job->target_seq - job->line_count;
+    uint32_t i = 0;
+    uint32_t completed = 0;
+    uint32_t cycle_lo = 0;
+    uint32_t cycle_hi = 0;
+    uint32_t last_dcr_rsp = 0;
+    int64_t started_us = g_get_monotonic_time();
+    bool cycle_valid = false;
+    bool last_dcr_valid = false;
+    bool ok = true;
+
+    scope_vortex_trace(v,
+                       "job start path=direct-p2p guest_tail=0x%" PRIx64
+                       " lines=%u virtual_target=%u physical_seq=%u\n",
+                       job->guest_tail, job->line_count, job->target_seq,
+                       v->physical_seq);
+
+    while (i < job->line_count && ok) {
+        uint8_t *line = job->lines + i * SCOPE_VX_CP_CL_SIZE;
+        uint8_t opcode = line[0];
+
+        scope_vortex_trace(v,
+                           "cmd=%u op=%s(0x%02x) arg0=0x%" PRIx64
+                           " arg1=0x%" PRIx64 " arg2=0x%" PRIx64 "\n",
+                           i, scope_vortex_opcode_name(opcode), opcode,
+                           ldq_le_p(line + 4), ldq_le_p(line + 12),
+                           ldq_le_p(line + 20));
+        if (opcode == SCOPE_VX_OP_MEM_WRITE ||
+            opcode == SCOPE_VX_OP_MEM_READ) {
+            uint8_t patched[SCOPE_VX_CP_CL_SIZE];
+
+            memcpy(patched, line, sizeof(patched));
+            ok = scope_vortex_patch_direct_mem(v, patched) &&
+                 scope_vortex_submit_physical(v, patched, 1);
+            if (ok) {
+                ++i;
+                ++completed;
+                scope_vortex_retire_direct(v, virtual_base + completed);
+            }
+            continue;
+        }
+
+        {
+            uint32_t batch_start = i;
+
+            while (i < job->line_count) {
+                line = job->lines + i * SCOPE_VX_CP_CL_SIZE;
+                opcode = line[0];
+                if (opcode == SCOPE_VX_OP_MEM_WRITE ||
+                    opcode == SCOPE_VX_OP_MEM_READ) {
+                    break;
+                }
+                scope_vortex_trace(v,
+                                   "cmd=%u op=%s(0x%02x) arg0=0x%" PRIx64
+                                   " arg1=0x%" PRIx64 " arg2=0x%" PRIx64 "\n",
+                                   i, scope_vortex_opcode_name(opcode), opcode,
+                                   ldq_le_p(line + 4), ldq_le_p(line + 12),
+                                   ldq_le_p(line + 20));
+                if (!scope_vortex_validate_nonmem_line(v, line)) {
+                    ok = false;
+                    break;
+                }
+                ++i;
+            }
+            if (ok) {
+                uint32_t batch_count = i - batch_start;
+                uint32_t j;
+
+                ok = scope_vortex_submit_physical(
+                    v, job->lines + batch_start * SCOPE_VX_CP_CL_SIZE,
+                    batch_count);
+                if (ok) {
+                    for (j = batch_start; j < i; ++j) {
+                        if (job->lines[j * SCOPE_VX_CP_CL_SIZE] ==
+                            SCOPE_VX_OP_DCR_READ) {
+                            last_dcr_valid = scope_vortex_rpc_cp_read(
+                                v, SCOPE_VX_CP_Q_LAST_DCR, &last_dcr_rsp);
+                            if (!last_dcr_valid) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (ok) {
+                    completed += batch_count;
+                    scope_vortex_retire_direct(v, virtual_base + completed);
+                }
+            }
+        }
+    }
+
+    if (ok) {
+        cycle_valid =
+            scope_vortex_rpc_cp_read(v, SCOPE_VX_CP_CYCLE_LO, &cycle_lo) &&
+            scope_vortex_rpc_cp_read(v, SCOPE_VX_CP_CYCLE_HI, &cycle_hi);
+        qemu_mutex_lock(&v->manager->state_lock);
+        if (cycle_valid) {
+            v->caps[1] = cycle_lo;
+            v->caps[2] = cycle_hi;
+        }
+        if (last_dcr_valid) {
+            v->last_dcr_rsp = last_dcr_rsp;
+        }
+        qemu_mutex_unlock(&v->manager->state_lock);
+    } else {
+        scope_vortex_fail_direct(v, job);
+    }
+
+    scope_vortex_trace(v,
+                       "job %s path=direct-p2p virtual_seq=%u physical_seq=%u"
+                       " elapsed_us=%" PRId64 " payload_cpu_bytes=0\n",
+                       ok ? "done" : "failed", job->target_seq,
+                       v->physical_seq,
+                       g_get_monotonic_time() - started_us);
+    return ok;
+}
+
+static bool scope_vortex_execute_job(ScopeVortexState *v, ScopeVortexJob *job)
+{
+    if (v->direct_p2p) {
+        return scope_vortex_execute_job_direct(v, job);
+    }
+    return scope_vortex_execute_job_mediated(v, job);
 }
 
 static void *scope_vortex_worker(void *opaque)
@@ -613,6 +1142,10 @@ static bool scope_vortex_try_submit_tail(ScopeVortexState *v)
     v->submitted_tail = v->pending_tail;
     v->submitted_seq = job->target_seq;
     v->pending_tail_valid = false;
+    scope_vortex_trace(v,
+                       "job queued guest_tail=0x%" PRIx64
+                       " lines=%u virtual_target=%u\n",
+                       job->guest_tail, job->line_count, job->target_seq);
     g_async_queue_push(v->jobs, job);
     return true;
 }
@@ -759,8 +1292,43 @@ static bool scope_vortex_backend_realize(ScopeProxyState *s, Error **errp)
     v->backend = be;
     v->socket_fd = -1;
     v->guest_ring_log2 = SCOPE_VX_CP_RING_LOG2;
+    v->direct_p2p = be->vortex_direct_p2p;
     if (!scope_vortex_connect(v, be->bridge_socket, errp)) {
         return false;
+    }
+    if (v->direct_p2p) {
+        if (s->guest_ddr_base != SCOPE_VX_P2P_GUEST_DDR_BASE ||
+            s->guest_ddr_size != SCOPE_VX_P2P_GUEST_DDR_SIZE ||
+            s->bypass_coherent_alias_base != SCOPE_VX_P2P_ALIAS_OFFSET ||
+            s->fpga_bypass_bar_index != SCOPE_VX_P2P_BAR_INDEX) {
+            error_setg(errp,
+                       "Vortex direct-P2P requires guest DDR "
+                       "[0x80000000,0x100000000), coherent alias 0x100000000, "
+                       "and NM37 BAR2");
+            return false;
+        }
+        if (!scope_vortex_rpc_peer_caps(v) ||
+            !(v->peer_caps.flags & SCOPE_VORTEX_RPC_CAP_PEER_MAP) ||
+            v->peer_caps.slot_size != SCOPE_VX_PEER_SLOT_SIZE ||
+            v->peer_caps.control_size != SCOPE_VX_PEER_WINDOW_SIZE ||
+            v->peer_caps.peer_size != SCOPE_VX_PEER_WINDOW_SIZE ||
+            v->peer_caps.host_base >
+                UINT64_MAX - v->peer_caps.control_size ||
+            v->peer_caps.peer_base !=
+                v->peer_caps.host_base + v->peer_caps.control_size ||
+            !s->fpga_host_bdf || s->fpga_bypass_bar_index < 0) {
+            error_setg(errp,
+                       "Vortex direct-P2P peer capabilities or NM37 BAR "
+                       "configuration are incompatible");
+            return false;
+        }
+        scope_vortex_trace(v,
+                           "path=direct-p2p control=[0x%" PRIx64
+                           ",+0x%" PRIx64 "] peer=[0x%" PRIx64
+                           ",+0x%" PRIx64 "] slot=0x%" PRIx64 "\n",
+                           v->peer_caps.host_base, v->peer_caps.control_size,
+                           v->peer_caps.peer_base, v->peer_caps.peer_size,
+                           v->peer_caps.slot_size);
     }
     if (!scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_CTRL, 2) ||
         !scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_Q_CONTROL, 2) ||
@@ -818,13 +1386,28 @@ static bool scope_vortex_backend_realize(ScopeProxyState *s, Error **errp)
         return false;
     }
 
+    /*
+     * Q_CONTROL.reset is only a pulse in the current RTL; it does not reset
+     * VX_cp_fetch.head_r or VX_cp_engine.seqnum_r.  A QEMU reconnect can
+     * therefore observe a non-zero sequence baseline even after reprogramming
+     * the physical ring.  The common runtime emits exactly one command per
+     * 64-byte line, so retired seqnum and fetch head advance in lockstep.
+     * Resume the monotonic tail at that head instead of incorrectly starting
+     * again at zero (which would leave head > tail and park the fetcher).
+     */
+    v->physical_tail = (uint64_t)v->physical_seq * SCOPE_VX_CP_CL_SIZE;
+    scope_vortex_trace(v,
+                       "physical queue baseline seq=%u tail=0x%" PRIx64 "\n",
+                       v->physical_seq, v->physical_tail);
+
     v->jobs = g_async_queue_new();
     qatomic_set(&v->worker_stop, 0);
     qemu_thread_create(&v->worker, "scope-vortex", scope_vortex_worker,
                        v, QEMU_THREAD_JOINABLE);
     v->worker_started = true;
-    SCOPE_PRINTF("[SCOPE VORTEX] backend=%u bridge=%s caps=0x%08x\n",
-                 be->id, be->bridge_socket, v->caps[0]);
+    SCOPE_PRINTF("[SCOPE VORTEX] backend=%u bridge=%s path=%s caps=0x%08x\n",
+                 be->id, be->bridge_socket,
+                 v->direct_p2p ? "direct-p2p" : "mediated", v->caps[0]);
     return true;
 }
 
@@ -850,10 +1433,17 @@ static void scope_vortex_backend_cleanup(ScopeProxyState *s, ScopeBackend *be)
         g_async_queue_unref(v->jobs);
     }
     if (v->socket_fd >= 0) {
+        if (v->direct_p2p) {
+            scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_CTRL, 0);
+            scope_vortex_rpc_peer_unmap(v);
+        }
         scope_vortex_rpc_free(v, v->physical_cmpl_handle);
         scope_vortex_rpc_free(v, v->physical_head_handle);
         scope_vortex_rpc_free(v, v->physical_ring_handle);
         close(v->socket_fd);
+    scope_vortex_trace(v, "cleanup path=%s payload_cpu_bytes=%" PRIu64 "\n",
+                       v->direct_p2p ? "direct-p2p" : "mediated",
+                       v->payload_cpu_bytes);
     }
     g_free(v);
     be->vortex = NULL;
