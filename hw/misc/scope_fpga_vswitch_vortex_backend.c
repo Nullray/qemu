@@ -30,6 +30,38 @@
 #define SCOPE_VX_CP_Q_ERROR            0x12cU
 #define SCOPE_VX_CP_Q_LAST_DCR         0x130U
 
+/* Virtual-only GDS control block.  These registers are never forwarded to CP. */
+#define SCOPE_VX_GDS_CAPS              0x200U
+#define SCOPE_VX_GDS_STATE             0x204U
+#define SCOPE_VX_GDS_ERROR             0x208U
+#define SCOPE_VX_GDS_COMMAND           0x20cU
+#define SCOPE_VX_GDS_SIZE_LO           0x210U
+#define SCOPE_VX_GDS_SIZE_HI           0x214U
+#define SCOPE_VX_GDS_HANDLE            0x218U
+#define SCOPE_VX_GDS_FLAGS             0x21cU
+#define SCOPE_VX_GDS_HBM_LO            0x220U
+#define SCOPE_VX_GDS_HBM_HI            0x224U
+#define SCOPE_VX_GDS_GENERATION_LO     0x228U
+#define SCOPE_VX_GDS_GENERATION_HI     0x22cU
+#define SCOPE_VX_GDS_NSID              0x230U
+#define SCOPE_VX_GDS_SLBA_LO           0x234U
+#define SCOPE_VX_GDS_SLBA_HI           0x238U
+#define SCOPE_VX_GDS_BYTES_LO          0x23cU
+#define SCOPE_VX_GDS_BYTES_HI          0x240U
+#define SCOPE_VX_GDS_OFFSET_LO         0x244U
+#define SCOPE_VX_GDS_OFFSET_HI         0x248U
+#define SCOPE_VX_GDS_TOKEN_LO          0x24cU
+#define SCOPE_VX_GDS_TOKEN_HI          0x250U
+#define SCOPE_VX_GDS_NVME_STATUS       0x254U
+#define SCOPE_VX_GDS_ALIGNMENT         0x258U
+#define SCOPE_VX_GDS_MAX_SIZE_LO       0x25cU
+#define SCOPE_VX_GDS_MAX_SIZE_HI       0x260U
+
+#define SCOPE_VX_GDS_CMD_ALLOC         1U
+#define SCOPE_VX_GDS_CMD_FREE          2U
+#define SCOPE_VX_GDS_CMD_ARM_READ      3U
+#define SCOPE_VX_GDS_CMD_RELEASE       4U
+
 #define SCOPE_VX_CP_RING_LOG2          16U
 #define SCOPE_VX_CP_RING_SIZE          (1U << SCOPE_VX_CP_RING_LOG2)
 #define SCOPE_VX_CP_CL_SIZE            64U
@@ -81,6 +113,7 @@ struct ScopeVortexState {
     ScopeBackend *backend;
     int socket_fd;
     uint32_t rpc_request_id;
+    uint32_t bridge_caps;
     GAsyncQueue *jobs;
     QemuThread worker;
     bool worker_started;
@@ -343,6 +376,39 @@ static bool scope_vortex_rpc_peer_unmap(ScopeVortexState *v)
     return true;
 }
 
+static bool scope_vortex_rpc_gds_caps(
+    ScopeVortexState *v, const struct scope_vortex_rpc_gds_caps_req *req,
+    struct scope_vortex_rpc_gds_caps_rsp *rsp)
+{
+    return scope_vortex_rpc(v, SCOPE_VORTEX_RPC_GDS_CAPS,
+                            req, sizeof(*req), rsp, sizeof(*rsp));
+}
+
+static bool scope_vortex_rpc_gds_alloc(
+    ScopeVortexState *v, uint64_t size,
+    struct scope_vortex_rpc_gds_alloc_rsp *rsp)
+{
+    struct scope_vortex_rpc_gds_alloc_req req = {
+        .size = size,
+        .alignment = v->manager->gds.alignment,
+    };
+
+    return scope_vortex_rpc(v, SCOPE_VORTEX_RPC_GDS_ALLOC,
+                            &req, sizeof(req), rsp, sizeof(*rsp));
+}
+
+static bool scope_vortex_rpc_gds_free(ScopeVortexState *v, uint32_t handle,
+                                      uint64_t generation)
+{
+    struct scope_vortex_rpc_gds_free req = {
+        .handle = handle,
+        .generation = generation,
+    };
+
+    return scope_vortex_rpc(v, SCOPE_VORTEX_RPC_GDS_FREE,
+                            &req, sizeof(req), NULL, 0);
+}
+
 static bool scope_vortex_connect(ScopeVortexState *v, const char *path,
                                  Error **errp)
 {
@@ -384,6 +450,7 @@ static bool scope_vortex_connect(ScopeVortexState *v, const char *path,
         error_setg(errp, "Vortex bridge protocol handshake failed");
         return false;
     }
+    v->bridge_caps = hello_rsp.capabilities;
     return true;
 }
 
@@ -1150,9 +1217,141 @@ static bool scope_vortex_try_submit_tail(ScopeVortexState *v)
     return true;
 }
 
+static void scope_vortex_gds_set_error(ScopeGdsState *gds, int error)
+{
+    gds->error = error;
+    if (error) {
+        gds->state = SCOPE_GDS_FAILED;
+    }
+}
+
+static bool scope_vortex_gds_command(ScopeVortexState *v, uint32_t command)
+{
+    ScopeGdsState *gds = &v->manager->gds;
+
+    if (!gds->enabled || gds->vortex_backend_id != v->backend->id) {
+        return false;
+    }
+    gds->error = 0;
+
+    switch (command) {
+    case SCOPE_VX_GDS_CMD_ALLOC: {
+        struct scope_vortex_rpc_gds_alloc_rsp rsp;
+
+        if (gds->state != SCOPE_GDS_IDLE || gds->handle) {
+            scope_vortex_gds_set_error(gds, -EBUSY);
+            return true;
+        }
+        if (!gds->alloc_size || gds->alloc_size > gds->max_size ||
+            gds->alloc_size > SCOPE_GDS_MAX_BYTES ||
+            (gds->alloc_size & (gds->alignment - 1U))) {
+            scope_vortex_gds_set_error(gds, -EINVAL);
+            return true;
+        }
+        memset(&rsp, 0, sizeof(rsp));
+        if (!scope_vortex_rpc_gds_alloc(v, gds->alloc_size, &rsp)) {
+            scope_vortex_gds_set_error(gds, -EIO);
+            return true;
+        }
+        if (!rsp.handle || !(rsp.flags & SCOPE_VORTEX_GDS_CAP_HBM0) ||
+            rsp.size < gds->alloc_size ||
+            rsp.p2p_bus_addr > UINT64_MAX - rsp.size ||
+            !scope_vortex_device_range_valid(v, rsp.hbm_addr, rsp.size)) {
+            scope_vortex_rpc_gds_free(v, rsp.handle, rsp.generation);
+            scope_vortex_gds_set_error(gds, -ERANGE);
+            return true;
+        }
+        gds->handle = rsp.handle;
+        gds->flags = rsp.flags;
+        gds->hbm_addr = rsp.hbm_addr;
+        gds->p2p_bus_addr = rsp.p2p_bus_addr;
+        gds->size = rsp.size;
+        gds->generation = rsp.generation;
+        gds->state = SCOPE_GDS_GPU_OWNED;
+        SCOPE_PRINTF("[SCOPE GDS] alloc handle=%u generation=%" PRIu64
+                     " hbm=0x%016" PRIx64 " p2p=0x%016" PRIx64
+                     " bytes=%" PRIu64 " payload_cpu_bytes=0\n",
+                     gds->handle, gds->generation, gds->hbm_addr,
+                     gds->p2p_bus_addr, gds->size);
+        SCOPE_FFLUSH(stdout);
+        return true;
+    }
+    case SCOPE_VX_GDS_CMD_FREE:
+        if (!gds->handle || gds->cmd_restore_valid ||
+            gds->state == SCOPE_GDS_ARMED ||
+            gds->state == SCOPE_GDS_NVME_INFLIGHT) {
+            scope_vortex_gds_set_error(gds, -EBUSY);
+            return true;
+        }
+        if (!scope_vortex_rpc_gds_free(v, gds->handle,
+                                       gds->generation)) {
+            scope_vortex_gds_set_error(gds, -EIO);
+            return true;
+        }
+        gds->handle = 0;
+        gds->flags = 0;
+        gds->hbm_addr = 0;
+        gds->p2p_bus_addr = 0;
+        gds->size = 0;
+        gds->generation = 0;
+        gds->alloc_size = 0;
+        gds->state = SCOPE_GDS_IDLE;
+        return true;
+    case SCOPE_VX_GDS_CMD_ARM_READ:
+        if (!gds->handle || gds->cmd_restore_valid ||
+            (gds->state != SCOPE_GDS_GPU_OWNED &&
+             gds->state != SCOPE_GDS_GPU_READY)) {
+            scope_vortex_gds_set_error(gds, -EBUSY);
+            return true;
+        }
+        if (!gds->req_nsid || !gds->req_bytes ||
+            gds->req_bytes > SCOPE_GDS_MAX_BYTES ||
+            (gds->req_bytes & 4095U) || (gds->req_offset & 4095U) ||
+            gds->req_offset > gds->size ||
+            gds->req_bytes > gds->size - gds->req_offset) {
+            scope_vortex_gds_set_error(gds, -EINVAL);
+            return true;
+        }
+        if (++gds->req_token == 0) {
+            ++gds->req_token;
+        }
+        gds->nvme_status = 0xffffU;
+        gds->state = SCOPE_GDS_ARMED;
+        SCOPE_PRINTF("[SCOPE GDS] armed token=%" PRIu64 " nsid=%u slba=%" PRIu64
+                     " bytes=%" PRIu64 " handle=%u generation=%" PRIu64
+                     " offset=%" PRIu64 "\n",
+                     gds->req_token, gds->req_nsid, gds->req_slba,
+                     gds->req_bytes, gds->handle, gds->generation,
+                     gds->req_offset);
+        SCOPE_FFLUSH(stdout);
+        return true;
+    case SCOPE_VX_GDS_CMD_RELEASE:
+        if (gds->cmd_restore_valid ||
+            (gds->state != SCOPE_GDS_ARMED &&
+             gds->state != SCOPE_GDS_GPU_READY &&
+             gds->state != SCOPE_GDS_FAILED)) {
+            scope_vortex_gds_set_error(gds, -EBUSY);
+            return true;
+        }
+        gds->error = 0;
+        gds->req_nsid = 0;
+        gds->req_slba = 0;
+        gds->req_bytes = 0;
+        gds->req_offset = 0;
+        gds->nvme_status = 0;
+        gds->state = gds->handle ? SCOPE_GDS_GPU_OWNED : SCOPE_GDS_IDLE;
+        return true;
+    default:
+        scope_vortex_gds_set_error(gds, -EINVAL);
+        return true;
+    }
+}
+
 static bool scope_vortex_bar_read(ScopeVortexState *v, uint32_t off,
                                   uint32_t *value)
 {
+    ScopeGdsState *gds = &v->manager->gds;
+
     switch (off) {
     case SCOPE_VX_CP_CTRL: *value = v->cp_ctrl; return true;
     case SCOPE_VX_CP_DEV_CAPS: *value = v->caps[0]; return true;
@@ -1175,6 +1374,26 @@ static bool scope_vortex_bar_read(ScopeVortexState *v, uint32_t off,
     case SCOPE_VX_CP_Q_SEQNUM: *value = v->retired_seq; return true;
     case SCOPE_VX_CP_Q_ERROR: *value = v->q_error; return true;
     case SCOPE_VX_CP_Q_LAST_DCR: *value = v->last_dcr_rsp; return true;
+    case SCOPE_VX_GDS_CAPS:
+        *value = gds->enabled ?
+            (1U | (1U << 8) | (1U << 9) | (1U << 10)) : 0;
+        return true;
+    case SCOPE_VX_GDS_STATE: *value = gds->state; return true;
+    case SCOPE_VX_GDS_ERROR: *value = (uint32_t)gds->error; return true;
+    case SCOPE_VX_GDS_SIZE_LO: *value = gds->size; return true;
+    case SCOPE_VX_GDS_SIZE_HI: *value = gds->size >> 32; return true;
+    case SCOPE_VX_GDS_HANDLE: *value = gds->handle; return true;
+    case SCOPE_VX_GDS_FLAGS: *value = gds->flags; return true;
+    case SCOPE_VX_GDS_HBM_LO: *value = gds->hbm_addr; return true;
+    case SCOPE_VX_GDS_HBM_HI: *value = gds->hbm_addr >> 32; return true;
+    case SCOPE_VX_GDS_GENERATION_LO: *value = gds->generation; return true;
+    case SCOPE_VX_GDS_GENERATION_HI: *value = gds->generation >> 32; return true;
+    case SCOPE_VX_GDS_TOKEN_LO: *value = gds->req_token; return true;
+    case SCOPE_VX_GDS_TOKEN_HI: *value = gds->req_token >> 32; return true;
+    case SCOPE_VX_GDS_NVME_STATUS: *value = gds->nvme_status; return true;
+    case SCOPE_VX_GDS_ALIGNMENT: *value = gds->alignment; return true;
+    case SCOPE_VX_GDS_MAX_SIZE_LO: *value = gds->max_size; return true;
+    case SCOPE_VX_GDS_MAX_SIZE_HI: *value = gds->max_size >> 32; return true;
     default: return false;
     }
 }
@@ -1182,6 +1401,8 @@ static bool scope_vortex_bar_read(ScopeVortexState *v, uint32_t off,
 static bool scope_vortex_bar_write(ScopeVortexState *v, uint32_t off,
                                    uint32_t value)
 {
+    ScopeGdsState *gds = &v->manager->gds;
+
     switch (off) {
     case SCOPE_VX_CP_CTRL:
         v->cp_ctrl = value & 1U;
@@ -1233,6 +1454,37 @@ static bool scope_vortex_bar_write(ScopeVortexState *v, uint32_t off,
         v->pending_tail_deadline_us =
             g_get_monotonic_time() + SCOPE_VX_GUEST_VISIBLE_TIMEOUT_US;
         scope_vortex_try_submit_tail(v);
+        return true;
+    case SCOPE_VX_GDS_COMMAND:
+        return scope_vortex_gds_command(v, value);
+    case SCOPE_VX_GDS_SIZE_LO:
+        gds->alloc_size = (gds->alloc_size & ~UINT64_C(0xffffffff)) | value;
+        return true;
+    case SCOPE_VX_GDS_SIZE_HI:
+        gds->alloc_size = (gds->alloc_size & UINT32_MAX) |
+                          ((uint64_t)value << 32);
+        return true;
+    case SCOPE_VX_GDS_NSID: gds->req_nsid = value; return true;
+    case SCOPE_VX_GDS_SLBA_LO:
+        gds->req_slba = (gds->req_slba & ~UINT64_C(0xffffffff)) | value;
+        return true;
+    case SCOPE_VX_GDS_SLBA_HI:
+        gds->req_slba = (gds->req_slba & UINT32_MAX) |
+                        ((uint64_t)value << 32);
+        return true;
+    case SCOPE_VX_GDS_BYTES_LO:
+        gds->req_bytes = (gds->req_bytes & ~UINT64_C(0xffffffff)) | value;
+        return true;
+    case SCOPE_VX_GDS_BYTES_HI:
+        gds->req_bytes = (gds->req_bytes & UINT32_MAX) |
+                         ((uint64_t)value << 32);
+        return true;
+    case SCOPE_VX_GDS_OFFSET_LO:
+        gds->req_offset = (gds->req_offset & ~UINT64_C(0xffffffff)) | value;
+        return true;
+    case SCOPE_VX_GDS_OFFSET_HI:
+        gds->req_offset = (gds->req_offset & UINT32_MAX) |
+                          ((uint64_t)value << 32);
         return true;
     default:
         return false;
@@ -1329,6 +1581,59 @@ static bool scope_vortex_backend_realize(ScopeProxyState *s, Error **errp)
                            v->peer_caps.host_base, v->peer_caps.control_size,
                            v->peer_caps.peer_base, v->peer_caps.peer_size,
                            v->peer_caps.slot_size);
+    }
+    if (be->gds_nvme_bdf) {
+        struct scope_vortex_rpc_gds_caps_req req = { 0 };
+        struct scope_vortex_rpc_gds_caps_rsp rsp = { 0 };
+        ScopeBackend *nvme = NULL;
+        uint16_t domain;
+        uint8_t bus;
+        uint8_t devfn;
+
+        if (!(v->bridge_caps & SCOPE_VORTEX_RPC_CAP_GDS_P2P) ||
+            !scope_vortex_parse_host_bdf(be->gds_nvme_bdf,
+                                         &domain, &bus, &devfn)) {
+            error_setg(errp,
+                       "Vortex bridge lacks GDS support for NVMe %s",
+                       be->gds_nvme_bdf);
+            return false;
+        }
+        req.domain = domain;
+        req.bus = bus;
+        req.devfn = devfn;
+        for (i = 0; i < s->backend_count; i++) {
+            if (s->backends[i].type == SCOPE_BACKEND_NVME &&
+                s->backends[i].real_host_bdf &&
+                !strcmp(s->backends[i].real_host_bdf,
+                        be->gds_nvme_bdf)) {
+                nvme = &s->backends[i];
+                break;
+            }
+        }
+        if (!nvme || !scope_vortex_rpc_gds_caps(v, &req, &rsp) ||
+            !(rsp.flags & SCOPE_VORTEX_GDS_CAP_HBM0) ||
+            rsp.alignment < 4096U ||
+            (rsp.alignment & (rsp.alignment - 1U)) ||
+            rsp.max_size < 4096U) {
+            error_setg(errp,
+                       "incompatible one-hop GDS capabilities for NVMe %s",
+                       be->gds_nvme_bdf);
+            return false;
+        }
+        s->gds.enabled = true;
+        s->gds.vortex_backend_id = be->id;
+        s->gds.nvme_backend_id = nvme->id;
+        s->gds.caps_flags = rsp.flags;
+        s->gds.alignment = rsp.alignment;
+        s->gds.max_size = MIN(rsp.max_size,
+                              (uint64_t)SCOPE_GDS_MAX_BYTES);
+        s->gds.state = SCOPE_GDS_IDLE;
+        SCOPE_PRINTF("[SCOPE GDS] enabled path=direct-p2p nvme=%s "
+                     "vortex_backend=%u nvme_backend=%u alignment=%u "
+                     "max_bytes=%" PRIu64 "\n",
+                     be->gds_nvme_bdf, be->id, nvme->id,
+                     s->gds.alignment, s->gds.max_size);
+        SCOPE_FFLUSH(stdout);
     }
     if (!scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_CTRL, 2) ||
         !scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_Q_CONTROL, 2) ||
@@ -1433,6 +1738,14 @@ static void scope_vortex_backend_cleanup(ScopeProxyState *s, ScopeBackend *be)
         g_async_queue_unref(v->jobs);
     }
     if (v->socket_fd >= 0) {
+        if (s->gds.enabled &&
+            s->gds.vortex_backend_id == be->id && s->gds.handle &&
+            s->gds.state != SCOPE_GDS_NVME_INFLIGHT) {
+            scope_vortex_rpc_gds_free(v, s->gds.handle,
+                                      s->gds.generation);
+            s->gds.handle = 0;
+            s->gds.state = SCOPE_GDS_IDLE;
+        }
         if (v->direct_p2p) {
             scope_vortex_rpc_cp_write(v, SCOPE_VX_CP_CTRL, 0);
             scope_vortex_rpc_peer_unmap(v);

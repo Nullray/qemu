@@ -92,6 +92,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 #define SCOPE_BACKEND_CONFIG_MAX      (64U * 1024U)
 #define SCOPE_VORTEX_BAR0_SIZE        0x1000U
 #define SCOPE_VORTEX_PCI_CLASS        0x1200U
+#define SCOPE_GDS_MAX_BYTES           (16U * 1024U * 1024U)
+#define SCOPE_GDS_MAX_RESTORE_PAGES   64U
 
 #ifndef SCOPE_PROXY_LOG_ENABLE
 #define SCOPE_PROXY_LOG_ENABLE 1
@@ -247,6 +249,58 @@ typedef struct ScopePendingDoorbell {
     int64_t next_visibility_retry_us;
 } ScopePendingDoorbell;
 
+typedef enum ScopeGdsBufferState {
+    SCOPE_GDS_DISABLED = 0,
+    SCOPE_GDS_IDLE = 1,
+    SCOPE_GDS_GPU_OWNED = 2,
+    SCOPE_GDS_ARMED = 3,
+    SCOPE_GDS_NVME_INFLIGHT = 4,
+    SCOPE_GDS_GPU_READY = 5,
+    SCOPE_GDS_FAILED = 6,
+} ScopeGdsBufferState;
+
+typedef struct ScopeGdsRestorePage {
+    uint64_t guest_pa;
+    uint32_t length;
+    uint8_t *bytes;
+} ScopeGdsRestorePage;
+
+typedef struct ScopeGdsState {
+    bool enabled;
+    uint8_t vortex_backend_id;
+    uint8_t nvme_backend_id;
+    uint32_t caps_flags;
+    uint32_t alignment;
+    uint64_t max_size;
+    uint64_t alloc_size;
+
+    ScopeGdsBufferState state;
+    int32_t error;
+    uint32_t handle;
+    uint32_t flags;
+    uint64_t hbm_addr;
+    uint64_t p2p_bus_addr;
+    uint64_t size;
+    uint64_t generation;
+
+    uint32_t req_nsid;
+    uint64_t req_slba;
+    uint64_t req_bytes;
+    uint64_t req_offset;
+    uint64_t req_token;
+    uint16_t qid;
+    uint16_t cid;
+    uint16_t nvme_status;
+    bool cmd_restore_valid;
+    uint64_t cmd_guest_pa;
+    NvmeCmd original_cmd;
+    ScopeGdsRestorePage restore_pages[SCOPE_GDS_MAX_RESTORE_PAGES];
+    uint32_t restore_page_count;
+    uint64_t completed_requests;
+    uint64_t payload_cpu_bytes;
+    uint64_t payload_nm37_bytes;
+} ScopeGdsState;
+
 typedef enum ScopeBackendType {
     SCOPE_BACKEND_NVME = 0,
     SCOPE_BACKEND_IGB,
@@ -264,6 +318,7 @@ typedef struct ScopeBackend {
     uint16_t virtual_bdf;
     char *real_host_bdf;
     char *bridge_socket;
+    char *gds_nvme_bdf;
     bool vortex_direct_p2p;
     int real_bar_fd;
     void *real_bar0_map;
@@ -356,6 +411,7 @@ struct ScopeProxyState {
     uint32_t backend_count;
     uint32_t dma32_ring_size;
     uint32_t bar_done_timeout_us;
+    ScopeGdsState gds;
 
     uint64_t guest_ddr_base;
     uint64_t guest_ddr_size;
@@ -469,6 +525,7 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
     bool have_socket = false;
     bool have_type = false;
     bool have_data_path = false;
+    bool have_gds_nvme = false;
 
     be->type = SCOPE_BACKEND_NVME;
 
@@ -555,6 +612,23 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                 }
                 be->bridge_socket = g_steal_pointer(&value);
                 have_socket = true;
+            } else if (!strcmp(key, "gds-nvme-bdf")) {
+                if (have_gds_nvme) {
+                    error_setg(errp,
+                               "backend config: duplicate gds-nvme-bdf");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value || !scope_valid_host_bdf(value)) {
+                    if (!*errp) {
+                        error_setg(errp,
+                                   "backend config: invalid GDS NVMe BDF '%s'",
+                                   value ? value : "");
+                    }
+                    return false;
+                }
+                be->gds_nvme_bdf = g_steal_pointer(&value);
+                have_gds_nvme = true;
             } else {
                 error_setg(errp, "backend config: unknown device key '%s'", key);
                 return false;
@@ -580,6 +654,13 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
     }
     if (be->type != SCOPE_BACKEND_VORTEX && (!have_bdf || have_socket)) {
         error_setg(errp, "backend config: nvme/igb require real-host-bdf and forbid bridge-socket");
+        return false;
+    }
+    if (have_gds_nvme &&
+        (be->type != SCOPE_BACKEND_VORTEX || !be->vortex_direct_p2p)) {
+        error_setg(errp,
+                   "backend config: gds-nvme-bdf requires a direct-p2p "
+                   "Vortex backend");
         return false;
     }
     return true;
@@ -707,6 +788,43 @@ static bool scope_parse_backend_config(ScopeProxyState *s, Error **errp)
     if (j.pos != j.len || !have_version || !have_devices || version != 1) {
         error_setg(errp, "backend config requires exactly version 1 and devices array");
         return false;
+    }
+    {
+        unsigned int vortex_gds_count = 0;
+
+        for (unsigned int i = 0; i < s->backend_count; i++) {
+            ScopeBackend *vortex = &s->backends[i];
+            bool found_nvme = false;
+
+            if (!vortex->gds_nvme_bdf) {
+                continue;
+            }
+            vortex_gds_count++;
+            for (unsigned int n = 0; n < s->backend_count; n++) {
+                ScopeBackend *nvme = &s->backends[n];
+
+                if (nvme->type == SCOPE_BACKEND_NVME &&
+                    nvme->real_host_bdf &&
+                    !strcmp(nvme->real_host_bdf,
+                            vortex->gds_nvme_bdf)) {
+                    found_nvme = true;
+                    break;
+                }
+            }
+            if (!found_nvme) {
+                error_setg(errp,
+                           "backend config: GDS NVMe %s is not present as "
+                           "an nvme device",
+                           vortex->gds_nvme_bdf);
+                return false;
+            }
+        }
+        if (vortex_gds_count > 1) {
+            error_setg(errp,
+                       "backend config: only one GDS Vortex/NVMe pair is "
+                       "currently supported");
+            return false;
+        }
     }
     return true;
 }
@@ -3067,6 +3185,253 @@ static bool scope_patch_prps_for_real_dma(ScopeProxyState *s, NvmeCmd *cmd,
     }
 }
 
+static void scope_gds_clear_restore_pages(ScopeGdsState *gds)
+{
+    uint32_t i;
+
+    for (i = 0; i < gds->restore_page_count; i++) {
+        g_free(gds->restore_pages[i].bytes);
+        memset(&gds->restore_pages[i], 0,
+               sizeof(gds->restore_pages[i]));
+    }
+    gds->restore_page_count = 0;
+}
+
+static bool scope_gds_save_restore_page(ScopeGdsState *gds,
+                                        uint64_t guest_pa,
+                                        const void *bytes, uint32_t length)
+{
+    ScopeGdsRestorePage *page;
+
+    if (gds->restore_page_count >= SCOPE_GDS_MAX_RESTORE_PAGES) {
+        return false;
+    }
+    page = &gds->restore_pages[gds->restore_page_count++];
+    page->bytes = g_memdup2(bytes, length);
+    page->guest_pa = guest_pa;
+    page->length = length;
+    return true;
+}
+
+static bool scope_gds_restore_descriptors(ScopeProxyState *s)
+{
+    ScopeGdsState *gds = &s->gds;
+    bool ok = true;
+    uint32_t i;
+
+    for (i = 0; i < gds->restore_page_count; i++) {
+        ScopeGdsRestorePage *page = &gds->restore_pages[i];
+
+        if (!scope_guest_mem_write(s, page->guest_pa,
+                                   page->bytes, page->length)) {
+            ok = false;
+        }
+    }
+    if (gds->cmd_restore_valid &&
+        !scope_guest_mem_write(s, gds->cmd_guest_pa,
+                               &gds->original_cmd,
+                               sizeof(gds->original_cmd))) {
+        ok = false;
+    }
+    scope_gds_clear_restore_pages(gds);
+    gds->cmd_restore_valid = false;
+    gds->cmd_guest_pa = 0;
+    return ok;
+}
+
+static bool scope_patch_gds_prp_list(ScopeProxyState *s, NvmeCmd *cmd,
+                                     uint64_t list_addr,
+                                     uint64_t target_addr,
+                                     uint64_t bytes_remaining,
+                                     uint32_t page_size)
+{
+    ScopeGdsState *gds = &s->gds;
+    uint32_t entries_per_page = page_size / sizeof(uint64_t);
+    uint64_t *entries = g_malloc(page_size);
+    uint32_t list_pages = 0;
+    bool ok = false;
+
+    while (bytes_remaining) {
+        uint64_t list_guest_pa = 0;
+        uint64_t list_real_pa = 0;
+        uint64_t data_pages = scope_div_round_up_u64(bytes_remaining,
+                                                      page_size);
+        uint64_t data_slots = data_pages > entries_per_page ?
+                              entries_per_page - 1U : data_pages;
+        bool has_next = data_pages > entries_per_page;
+        uint64_t next_addr = 0;
+
+        if (++list_pages > SCOPE_GDS_MAX_RESTORE_PAGES || !data_slots ||
+            !scope_translate_cmd_dma_addr_for_real(s, list_addr, page_size,
+                                                   "gds.prp_list",
+                                                   &list_guest_pa,
+                                                   &list_real_pa) ||
+            !scope_guest_mem_read(s, list_guest_pa, entries, page_size) ||
+            !scope_gds_save_restore_page(gds, list_guest_pa,
+                                         entries, page_size)) {
+            goto out;
+        }
+        if (list_pages == 1) {
+            cmd->dptr.prp2 = cpu_to_le64(list_real_pa);
+        }
+        if (has_next) {
+            uint64_t next_real_pa = 0;
+
+            next_addr = le64_to_cpu(entries[entries_per_page - 1U]);
+            if (!next_addr ||
+                !scope_translate_cmd_dma_addr_for_real(
+                    s, next_addr, page_size, "gds.prp_list.next",
+                    NULL, &next_real_pa)) {
+                goto out;
+            }
+            entries[entries_per_page - 1U] = cpu_to_le64(next_real_pa);
+        }
+        for (uint64_t i = 0; i < data_slots; i++) {
+            uint64_t entry_len = scope_min_u64(bytes_remaining, page_size);
+
+            entries[i] = cpu_to_le64(target_addr);
+            target_addr += entry_len;
+            bytes_remaining -= entry_len;
+        }
+        if (!scope_guest_mem_write(s, list_guest_pa, entries, page_size)) {
+            goto out;
+        }
+        list_addr = next_addr;
+    }
+    ok = true;
+out:
+    g_free(entries);
+    return ok;
+}
+
+typedef enum ScopeGdsPatchResult {
+    SCOPE_GDS_PATCH_NONE = 0,
+    SCOPE_GDS_PATCH_OK,
+    SCOPE_GDS_PATCH_FAILED,
+} ScopeGdsPatchResult;
+
+static ScopeGdsPatchResult scope_patch_gds_io_cmd(
+    ScopeProxyState *s, const ScopeSqState *sq, uint64_t cmd_guest_pa,
+    NvmeCmd *cmd, uint64_t data_len)
+{
+    ScopeGdsState *gds = &s->gds;
+    NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
+    uint32_t page_size = s->active->ctrl_page_size ?
+                         s->active->ctrl_page_size :
+                         SCOPE_NVME_DEFAULT_CTRL_PAGE_SIZE;
+    uint64_t target_addr;
+    uint64_t remaining;
+    uint64_t first_len;
+    bool ok = false;
+
+    if (!gds->enabled || s->active->id != gds->nvme_backend_id ||
+        gds->state != SCOPE_GDS_ARMED || cmd->opcode != NVME_CMD_READ ||
+        le32_to_cpu(rw->nsid) != gds->req_nsid ||
+        le64_to_cpu(rw->slba) != gds->req_slba ||
+        data_len != gds->req_bytes) {
+        return SCOPE_GDS_PATCH_NONE;
+    }
+
+    gds->qid = sq->qid;
+    gds->cid = le16_to_cpu(cmd->cid);
+    gds->cmd_guest_pa = cmd_guest_pa;
+    gds->original_cmd = *cmd;
+    gds->cmd_restore_valid = true;
+    scope_gds_clear_restore_pages(gds);
+
+    target_addr = gds->p2p_bus_addr + gds->req_offset;
+    if (NVME_CMD_FLAGS_PSDT(cmd->flags) != NVME_PSDT_PRP || cmd->mptr ||
+        page_size < 4096U || (page_size & (page_size - 1U)) ||
+        (target_addr & (page_size - 1U)) ||
+        target_addr > UINT64_MAX - data_len) {
+        goto failed;
+    }
+
+    first_len = scope_min_u64(data_len, page_size);
+    cmd->dptr.prp1 = cpu_to_le64(target_addr);
+    target_addr += first_len;
+    remaining = data_len - first_len;
+    if (!remaining) {
+        cmd->dptr.prp2 = 0;
+        ok = true;
+    } else if (remaining <= page_size) {
+        cmd->dptr.prp2 = cpu_to_le64(target_addr);
+        ok = true;
+    } else if (le64_to_cpu(gds->original_cmd.dptr.prp2)) {
+        ok = scope_patch_gds_prp_list(
+            s, cmd, le64_to_cpu(gds->original_cmd.dptr.prp2),
+            target_addr, remaining, page_size);
+    }
+
+    if (!ok) {
+        goto failed;
+    }
+    gds->state = SCOPE_GDS_NVME_INFLIGHT;
+    gds->error = 0;
+    SCOPE_PRINTF("[SCOPE GDS] op=READ qid=%u cid=%u nsid=%u slba=%" PRIu64
+                 " bytes=%" PRIu64 " handle=%u generation=%" PRIu64
+                 " hbm_addr=0x%016" PRIx64
+                 " p2p_bus_addr=0x%016" PRIx64
+                 " payload_cpu_bytes=0 payload_nm37_bytes=0\n",
+                 gds->qid, gds->cid, gds->req_nsid, gds->req_slba,
+                 gds->req_bytes, gds->handle, gds->generation,
+                 gds->hbm_addr + gds->req_offset,
+                 gds->p2p_bus_addr + gds->req_offset);
+    SCOPE_FFLUSH(stdout);
+    return SCOPE_GDS_PATCH_OK;
+
+failed:
+    scope_gds_restore_descriptors(s);
+    /* Submit an invalid command so the stock NVMe request receives an error. */
+    gds->cmd_guest_pa = cmd_guest_pa;
+    gds->cmd_restore_valid = true;
+    cmd->opcode = 0xffU;
+    cmd->mptr = 0;
+    cmd->dptr.prp1 = 0;
+    cmd->dptr.prp2 = 0;
+    gds->state = SCOPE_GDS_FAILED;
+    gds->error = -EINVAL;
+    return SCOPE_GDS_PATCH_FAILED;
+}
+
+static void scope_gds_complete_cqe(ScopeProxyState *s, const NvmeCqe *cqe)
+{
+    ScopeGdsState *gds = &s->gds;
+    uint16_t status;
+    bool restored;
+
+    if (!gds->enabled || !gds->cmd_restore_valid ||
+        s->active->id != gds->nvme_backend_id ||
+        le16_to_cpu(cqe->sq_id) != gds->qid ||
+        le16_to_cpu(cqe->cid) != gds->cid) {
+        return;
+    }
+    status = le16_to_cpu(cqe->status);
+    restored = scope_gds_restore_descriptors(s);
+    gds->nvme_status = status;
+    if (gds->state != SCOPE_GDS_FAILED) {
+        if (restored && (status >> 1) == NVME_SUCCESS) {
+            gds->state = SCOPE_GDS_GPU_READY;
+            gds->error = 0;
+        } else {
+            gds->state = SCOPE_GDS_FAILED;
+            gds->error = restored ? -EIO : -EFAULT;
+        }
+    } else if (!restored) {
+        gds->error = -EFAULT;
+    }
+    gds->completed_requests++;
+    smp_mb();
+    SCOPE_PRINTF("[SCOPE GDS] complete qid=%u cid=%u token=%" PRIu64
+                 " status=0x%04x state=%u error=%d"
+                 " payload_cpu_bytes=%" PRIu64
+                 " payload_nm37_bytes=%" PRIu64 "\n",
+                 gds->qid, gds->cid, gds->req_token, status,
+                 gds->state, gds->error, gds->payload_cpu_bytes,
+                 gds->payload_nm37_bytes);
+    SCOPE_FFLUSH(stdout);
+}
+
 static bool scope_patch_common_command_buffers(ScopeProxyState *s, NvmeCmd *cmd,
                                                uint64_t data_len,
                                                const char *tag,
@@ -3331,9 +3696,15 @@ static bool scope_patch_admin_cmd(ScopeProxyState *s, NvmeCmd *cmd,
 }
 
 static bool scope_patch_io_cmd(ScopeProxyState *s, const ScopeSqState *sq,
-                               NvmeCmd *cmd)
+                               uint64_t cmd_guest_pa, NvmeCmd *cmd)
 {
     uint64_t data_len = scope_io_cmd_data_len(s, cmd);
+    ScopeGdsPatchResult gds_result =
+        scope_patch_gds_io_cmd(s, sq, cmd_guest_pa, cmd, data_len);
+
+    if (gds_result != SCOPE_GDS_PATCH_NONE) {
+        return true;
+    }
 
     if (data_len && SCOPE_DEBUG_IO_PRP_TRACE) {
         SCOPE_PRINTF("[SCOPE PROXY][CMD][IO][LEN] qid=%u opcode=0x%02x cid=%u "
@@ -3417,7 +3788,7 @@ static ScopeSqeReadStatus scope_process_new_sq_entries(ScopeProxyState *s,
 
         ok = (sq->qid == SCOPE_ADMIN_QID) ?
             scope_patch_admin_cmd(s, &cmd, &pending_admin_op) :
-            scope_patch_io_cmd(s, sq, &cmd);
+            scope_patch_io_cmd(s, sq, cmd_guest_pa, &cmd);
         if (!ok) {
             scope_log_nvme_cmd("PATCH_ERR", sq, cursor, cmd_guest_pa, &cmd);
             scope_log_nvme_cmd_dwords("PATCH_ERR", sq, cursor, cmd_guest_pa, &cmd);
@@ -3647,6 +4018,9 @@ static bool scope_refresh_cq_shadow_tail(ScopeProxyState *s, ScopeCqState *cq,
             SCOPE_IO_FFLUSH(stdout);
         }
         scope_log_cqe_raw("SEEN", cq->qid, cq->shadow_tail, guest_pa, &cqe);
+        if (cq->qid != SCOPE_ADMIN_QID) {
+            scope_gds_complete_cqe(s, &cqe);
+        }
         if (!scope_publish_guest_cqe_for_cpu(s, cq, guest_pa, &cqe)) {
             break;
         }
@@ -4705,6 +5079,28 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
         s->rx_thread_started = false;
     }
 
+    if (s->backends && s->gds.enabled && s->gds.cmd_restore_valid) {
+        ScopeBackend *saved = s->active;
+
+        if (s->gds.state == SCOPE_GDS_NVME_INFLIGHT &&
+            s->gds.nvme_backend_id < s->backend_count) {
+            Error *local_err = NULL;
+
+            s->active = &s->backends[s->gds.nvme_backend_id];
+            if (!scope_real_nvme_disable(s, "GDS teardown", &local_err)) {
+                if (local_err) {
+                    error_report_err(local_err);
+                }
+            }
+        }
+        scope_gds_restore_descriptors(s);
+        s->gds.state = SCOPE_GDS_FAILED;
+        s->gds.error = -ECANCELED;
+        s->active = saved;
+    } else {
+        scope_gds_clear_restore_pages(&s->gds);
+    }
+
     if (s->dma32_db_map) {
         munmap(s->dma32_db_map, s->dma32_db.size);
         s->dma32_db_map = NULL;
@@ -4731,6 +5127,7 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
             if (be->ns_lba_shift_map) g_hash_table_destroy(be->ns_lba_shift_map);
             g_free(be->real_host_bdf);
             g_free(be->bridge_socket);
+            g_free(be->gds_nvme_bdf);
         }
     }
     if (s->xdma_bypass_fd >= 0) {

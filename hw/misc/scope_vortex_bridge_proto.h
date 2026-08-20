@@ -5,8 +5,10 @@
 #include <stdint.h>
 
 #define SCOPE_VORTEX_RPC_MAGIC       0x56585250U
-#define SCOPE_VORTEX_RPC_VERSION     2U
+#define SCOPE_VORTEX_RPC_VERSION     3U
 #define SCOPE_VORTEX_RPC_CAP_PEER_MAP (1U << 0)
+#define SCOPE_VORTEX_RPC_CAP_GDS_P2P  (1U << 1)
+#define SCOPE_VORTEX_GDS_CAP_HBM0     (1U << 0)
 #define SCOPE_VORTEX_HELLO_DIRECT_P2P (1U << 0)
 #define SCOPE_VORTEX_RPC_MAX_PAYLOAD (16U * 1024U * 1024U)
 
@@ -21,6 +23,9 @@ enum scope_vortex_rpc_op {
     SCOPE_VORTEX_RPC_PEER_CAPS,
     SCOPE_VORTEX_RPC_PEER_MAP,
     SCOPE_VORTEX_RPC_PEER_UNMAP,
+    SCOPE_VORTEX_RPC_GDS_CAPS,
+    SCOPE_VORTEX_RPC_GDS_ALLOC,
+    SCOPE_VORTEX_RPC_GDS_FREE,
 };
 
 struct scope_vortex_rpc_hello_req {
@@ -65,6 +70,39 @@ struct scope_vortex_rpc_peer_unmap {
     uint64_t generation;
 } QEMU_PACKED;
 
+struct scope_vortex_rpc_gds_caps_req {
+    uint16_t domain;
+    uint8_t bus;
+    uint8_t devfn;
+    uint32_t reserved;
+} QEMU_PACKED;
+
+struct scope_vortex_rpc_gds_caps_rsp {
+    uint32_t flags;
+    uint32_t alignment;
+    uint64_t max_size;
+} QEMU_PACKED;
+
+struct scope_vortex_rpc_gds_alloc_req {
+    uint64_t size;
+    uint64_t alignment;
+} QEMU_PACKED;
+
+struct scope_vortex_rpc_gds_alloc_rsp {
+    uint32_t handle;
+    uint32_t flags;
+    uint64_t hbm_addr;
+    uint64_t p2p_bus_addr;
+    uint64_t size;
+    uint64_t generation;
+} QEMU_PACKED;
+
+struct scope_vortex_rpc_gds_free {
+    uint32_t handle;
+    uint32_t reserved;
+    uint64_t generation;
+} QEMU_PACKED;
+
 struct scope_vortex_rpc_header {
     uint32_t magic;
     uint16_t version;
@@ -103,6 +141,11 @@ _Static_assert(sizeof(struct scope_vortex_rpc_peer_caps) == 56, "RPC peer caps A
 _Static_assert(sizeof(struct scope_vortex_rpc_peer_map_req) == 28, "RPC peer map request ABI");
 _Static_assert(sizeof(struct scope_vortex_rpc_peer_map_rsp) == 32, "RPC peer map response ABI");
 _Static_assert(sizeof(struct scope_vortex_rpc_peer_unmap) == 8, "RPC peer unmap ABI");
+_Static_assert(sizeof(struct scope_vortex_rpc_gds_caps_req) == 8, "RPC GDS caps request ABI");
+_Static_assert(sizeof(struct scope_vortex_rpc_gds_caps_rsp) == 16, "RPC GDS caps response ABI");
+_Static_assert(sizeof(struct scope_vortex_rpc_gds_alloc_req) == 16, "RPC GDS alloc request ABI");
+_Static_assert(sizeof(struct scope_vortex_rpc_gds_alloc_rsp) == 40, "RPC GDS alloc response ABI");
+_Static_assert(sizeof(struct scope_vortex_rpc_gds_free) == 16, "RPC GDS free ABI");
 _Static_assert(sizeof(struct scope_vortex_rpc_reg) == 8, "RPC register ABI");
 _Static_assert(sizeof(struct scope_vortex_rpc_alloc_req) == 8, "RPC alloc request ABI");
 _Static_assert(sizeof(struct scope_vortex_rpc_alloc_rsp) == 24, "RPC alloc response ABI");
