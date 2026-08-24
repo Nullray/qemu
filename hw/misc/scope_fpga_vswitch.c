@@ -10,7 +10,9 @@
 #include "qemu/atomic.h"
 #include "block/nvme.h"
 #include "hw/net/igb_regs.h"
+#include "net/checksum.h"
 #include "hw/misc/scope_fpga_vswitch_abi.h"
+#include "hw/misc/scope_fpga_vswitch_rdma.h"
 #include "hw/misc/scope_vortex_bridge_proto.h"
 
 #include <fcntl.h>
@@ -91,9 +93,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 #define SCOPE_ROUTE_CTRL              0x10U
 #define SCOPE_BACKEND_CONFIG_MAX      (64U * 1024U)
 #define SCOPE_VORTEX_BAR0_SIZE        0x1000U
+#define SCOPE_IXGBE_BAR0_SIZE         0x20000U
 #define SCOPE_VORTEX_PCI_CLASS        0x1200U
 #define SCOPE_GDS_MAX_BYTES           (16U * 1024U * 1024U)
 #define SCOPE_GDS_MAX_RESTORE_PAGES   64U
+#define SCOPE_REMOTE_MAX_INFLIGHT      64U
+#define SCOPE_REMOTE_DEFAULT_SERVICE  "7471"
+#define SCOPE_REMOTE_DEFAULT_PEER_DEV "/dev/xdma0_peer"
+#define SCOPE_REMOTE_DEFAULT_STAGING_SIZE (4U * 1024U * 1024U)
 
 #ifndef SCOPE_PROXY_LOG_ENABLE
 #define SCOPE_PROXY_LOG_ENABLE 1
@@ -304,21 +311,60 @@ typedef struct ScopeGdsState {
 typedef enum ScopeBackendType {
     SCOPE_BACKEND_NVME = 0,
     SCOPE_BACKEND_IGB,
+    SCOPE_BACKEND_IXGBE,
     SCOPE_BACKEND_VORTEX,
 } ScopeBackendType;
 
+typedef enum ScopeBackendTransport {
+    SCOPE_TRANSPORT_LOCAL_P2P = 0,
+    SCOPE_TRANSPORT_REMOTE_RDMA,
+} ScopeBackendTransport;
+
+typedef struct ScopeRemoteRequest {
+    bool valid;
+    uint64_t request_id;
+    uint16_t qid;
+    uint16_t cid;
+    uint16_t sq_head;
+    uint16_t cqid;
+    uint32_t data_len;
+    uint32_t direction;
+    uint32_t segment_count;
+    struct scope_remote_segment segments[SCOPE_REMOTE_MAX_SEGMENTS];
+    int64_t submitted_us;
+} ScopeRemoteRequest;
+
 typedef struct ScopeIgbState ScopeIgbState;
+typedef struct ScopeIxgbeState ScopeIxgbeState;
 typedef struct ScopeVortexState ScopeVortexState;
 typedef struct ScopeBackendOps ScopeBackendOps;
 
 typedef struct ScopeBackend {
     ScopeBackendType type;
+    ScopeBackendTransport transport;
     const ScopeBackendOps *ops;
     uint8_t id;
     uint16_t virtual_bdf;
     char *real_host_bdf;
     char *bridge_socket;
     char *gds_nvme_bdf;
+    char *remote_host;
+    char *remote_service;
+    char *remote_device_id;
+    char *rdma_device;
+    char *peer_memory_device;
+    ScopeRemoteMemoryMode remote_memory_mode;
+    uint32_t remote_staging_size;
+    uint32_t remote_namespace_id;
+    uint32_t remote_max_transfer_bytes;
+    uint32_t remote_max_inflight;
+    ScopeRemoteState *remote;
+    ScopeRemoteRequest remote_req[SCOPE_REMOTE_MAX_INFLIGHT];
+    uint64_t remote_next_request_id;
+    uint32_t remote_inflight;
+    uint64_t remote_completed;
+    uint64_t remote_failed;
+    bool remote_failed_state;
     bool vortex_direct_p2p;
     int real_bar_fd;
     void *real_bar0_map;
@@ -349,6 +395,7 @@ typedef struct ScopeBackend {
     bool intx_pending;
     int64_t last_pending_log_us;
     ScopeIgbState *igb;
+    ScopeIxgbeState *ixgbe;
     ScopeVortexState *vortex;
 } ScopeBackend;
 
@@ -365,6 +412,7 @@ struct ScopeBackendOps {
 
 static const ScopeBackendOps scope_nvme_backend_ops;
 static const ScopeBackendOps scope_igb_backend_ops;
+static const ScopeBackendOps scope_ixgbe_backend_ops;
 static const ScopeBackendOps scope_vortex_backend_ops;
 static bool scope_nvme_backend_realize(ScopeProxyState *s, Error **errp);
 static void scope_nvme_backend_cleanup(ScopeProxyState *s, ScopeBackend *be);
@@ -509,6 +557,28 @@ static char *scope_json_string(ScopeJsonCursor *j, Error **errp)
     return NULL;
 }
 
+static bool scope_json_uint32(ScopeJsonCursor *j, uint32_t *value,
+                              Error **errp)
+{
+    uint64_t parsed = 0;
+
+    scope_json_ws(j);
+    if (j->pos >= j->len || !g_ascii_isdigit(j->buf[j->pos])) {
+        error_setg(errp, "backend config: expected unsigned integer at byte %zu",
+                   j->pos);
+        return false;
+    }
+    while (j->pos < j->len && g_ascii_isdigit(j->buf[j->pos])) {
+        parsed = parsed * 10U + (j->buf[j->pos++] - '0');
+        if (parsed > UINT32_MAX) {
+            error_setg(errp, "backend config: integer exceeds uint32 range");
+            return false;
+        }
+    }
+    *value = parsed;
+    return true;
+}
+
 static bool scope_valid_host_bdf(const char *s)
 {
     unsigned int domain, bus, dev, fn;
@@ -526,8 +596,21 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
     bool have_type = false;
     bool have_data_path = false;
     bool have_gds_nvme = false;
+    bool have_transport = false;
+    bool have_remote_host = false;
+    bool have_remote_service = false;
+    bool have_remote_device = false;
+    bool have_rdma_device = false;
+    bool have_peer_device = false;
+    bool have_rdma_memory_mode = false;
+    bool have_rdma_staging_size = false;
+    bool have_namespace = false;
 
     be->type = SCOPE_BACKEND_NVME;
+    be->transport = SCOPE_TRANSPORT_LOCAL_P2P;
+    be->remote_namespace_id = 1;
+    be->remote_memory_mode = SCOPE_REMOTE_MEMORY_PEER_DMABUF;
+    be->remote_staging_size = SCOPE_REMOTE_DEFAULT_STAGING_SIZE;
 
     if (!scope_json_ch(j, '{', errp)) {
         return false;
@@ -555,6 +638,8 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                     be->type = SCOPE_BACKEND_NVME;
                 } else if (!strcmp(value, "igb")) {
                     be->type = SCOPE_BACKEND_IGB;
+                } else if (!strcmp(value, "ixgbe")) {
+                    be->type = SCOPE_BACKEND_IXGBE;
                 } else if (!strcmp(value, "vortex")) {
                     be->type = SCOPE_BACKEND_VORTEX;
                 } else {
@@ -578,6 +663,156 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                 }
                 be->real_host_bdf = g_steal_pointer(&value);
                 have_bdf = true;
+            } else if (!strcmp(key, "transport")) {
+                if (have_transport) {
+                    error_setg(errp, "backend config: duplicate transport");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value) {
+                    return false;
+                }
+                if (!strcmp(value, "local-p2p")) {
+                    be->transport = SCOPE_TRANSPORT_LOCAL_P2P;
+                } else if (!strcmp(value, "remote-rdma")) {
+                    be->transport = SCOPE_TRANSPORT_REMOTE_RDMA;
+                } else {
+                    error_setg(errp,
+                               "backend config: unsupported transport '%s'",
+                               value);
+                    return false;
+                }
+                have_transport = true;
+            } else if (!strcmp(key, "remote-host")) {
+                if (have_remote_host) {
+                    error_setg(errp, "backend config: duplicate remote-host");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value || !value[0]) {
+                    if (!*errp) {
+                        error_setg(errp, "backend config: remote-host is empty");
+                    }
+                    return false;
+                }
+                be->remote_host = g_steal_pointer(&value);
+                have_remote_host = true;
+            } else if (!strcmp(key, "remote-service")) {
+                if (have_remote_service) {
+                    error_setg(errp, "backend config: duplicate remote-service");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value || !value[0]) {
+                    if (!*errp) {
+                        error_setg(errp, "backend config: remote-service is empty");
+                    }
+                    return false;
+                }
+                be->remote_service = g_steal_pointer(&value);
+                have_remote_service = true;
+            } else if (!strcmp(key, "remote-device-id")) {
+                if (have_remote_device) {
+                    error_setg(errp, "backend config: duplicate remote-device-id");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value || !value[0] ||
+                    strlen(value) >= SCOPE_REMOTE_MAX_DEVICE_ID) {
+                    if (!*errp) {
+                        error_setg(errp,
+                                   "backend config: invalid remote-device-id");
+                    }
+                    return false;
+                }
+                be->remote_device_id = g_steal_pointer(&value);
+                have_remote_device = true;
+            } else if (!strcmp(key, "rdma-device")) {
+                if (have_rdma_device) {
+                    error_setg(errp, "backend config: duplicate rdma-device");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value || !value[0]) {
+                    if (!*errp) {
+                        error_setg(errp, "backend config: rdma-device is empty");
+                    }
+                    return false;
+                }
+                be->rdma_device = g_steal_pointer(&value);
+                have_rdma_device = true;
+            } else if (!strcmp(key, "peer-memory-device")) {
+                if (have_peer_device) {
+                    error_setg(errp,
+                               "backend config: duplicate peer-memory-device");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value || value[0] != '/') {
+                    if (!*errp) {
+                        error_setg(errp,
+                                   "backend config: peer-memory-device must be absolute");
+                    }
+                    return false;
+                }
+                be->peer_memory_device = g_steal_pointer(&value);
+                have_peer_device = true;
+            } else if (!strcmp(key, "rdma-memory-mode")) {
+                if (have_rdma_memory_mode) {
+                    error_setg(errp,
+                               "backend config: duplicate rdma-memory-mode");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value) {
+                    return false;
+                }
+                if (!strcmp(value, "peer-dmabuf")) {
+                    be->remote_memory_mode =
+                        SCOPE_REMOTE_MEMORY_PEER_DMABUF;
+                } else if (!strcmp(value, "host-staging")) {
+                    be->remote_memory_mode =
+                        SCOPE_REMOTE_MEMORY_HOST_STAGING;
+                } else {
+                    error_setg(errp,
+                               "backend config: unsupported RDMA memory mode '%s'",
+                               value);
+                    return false;
+                }
+                have_rdma_memory_mode = true;
+            } else if (!strcmp(key, "rdma-staging-size")) {
+                if (have_rdma_staging_size) {
+                    error_setg(errp,
+                               "backend config: duplicate rdma-staging-size");
+                    return false;
+                }
+                if (!scope_json_uint32(j, &be->remote_staging_size, errp) ||
+                    be->remote_staging_size < 4096U ||
+                    be->remote_staging_size > 64U * 1024U * 1024U ||
+                    (be->remote_staging_size & 4095U)) {
+                    if (!*errp) {
+                        error_setg(errp,
+                                   "backend config: rdma-staging-size must be "
+                                   "a 4 KiB multiple up to 64 MiB");
+                    }
+                    return false;
+                }
+                have_rdma_staging_size = true;
+            } else if (!strcmp(key, "namespace-id")) {
+                if (have_namespace) {
+                    error_setg(errp, "backend config: duplicate namespace-id");
+                    return false;
+                }
+                if (!scope_json_uint32(j, &be->remote_namespace_id, errp) ||
+                    !be->remote_namespace_id ||
+                    be->remote_namespace_id == NVME_NSID_BROADCAST) {
+                    if (!*errp) {
+                        error_setg(errp,
+                                   "backend config: namespace-id must be concrete");
+                    }
+                    return false;
+                }
+                have_namespace = true;
             } else if (!strcmp(key, "data-path")) {
                 if (have_data_path) {
                     error_setg(errp, "backend config: duplicate data-path");
@@ -648,12 +883,82 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                    "backend config: data-path is valid only for vortex");
         return false;
     }
+    if (be->transport == SCOPE_TRANSPORT_REMOTE_RDMA) {
+        if (be->type != SCOPE_BACKEND_NVME &&
+            be->type != SCOPE_BACKEND_IXGBE) {
+            error_setg(errp,
+                       "backend config: remote-rdma supports nvme or ixgbe");
+            return false;
+        }
+        if (have_bdf || have_socket || have_data_path || have_gds_nvme) {
+            error_setg(errp,
+                       "backend config: remote-rdma forbids local BDF/socket/GDS fields");
+            return false;
+        }
+        if (!have_remote_host || !have_remote_device || !have_rdma_device) {
+            error_setg(errp,
+                       "backend config: remote-rdma requires remote-host, "
+                       "remote-device-id and rdma-device");
+            return false;
+        }
+        if (!have_remote_service) {
+            be->remote_service = g_strdup(SCOPE_REMOTE_DEFAULT_SERVICE);
+        }
+        if (be->remote_memory_mode == SCOPE_REMOTE_MEMORY_PEER_DMABUF &&
+            !have_peer_device) {
+            be->peer_memory_device =
+                g_strdup(SCOPE_REMOTE_DEFAULT_PEER_DEV);
+        }
+        if (be->remote_memory_mode == SCOPE_REMOTE_MEMORY_HOST_STAGING &&
+            have_peer_device) {
+            error_setg(errp,
+                       "backend config: host-staging forbids peer-memory-device");
+            return false;
+        }
+        if (be->remote_memory_mode != SCOPE_REMOTE_MEMORY_HOST_STAGING &&
+            have_rdma_staging_size) {
+            error_setg(errp,
+                       "backend config: rdma-staging-size requires "
+                       "rdma-memory-mode=host-staging");
+            return false;
+        }
+        if (be->type == SCOPE_BACKEND_IXGBE) {
+            if (be->remote_memory_mode != SCOPE_REMOTE_MEMORY_HOST_STAGING) {
+                error_setg(errp,
+                           "backend config: ixgbe requires "
+                           "rdma-memory-mode=host-staging");
+                return false;
+            }
+            if (have_namespace || have_peer_device) {
+                error_setg(errp,
+                           "backend config: ixgbe forbids namespace-id and "
+                           "peer-memory-device");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (have_remote_host || have_remote_service || have_remote_device ||
+        have_rdma_device || have_peer_device || have_rdma_memory_mode ||
+        have_rdma_staging_size || have_namespace) {
+        error_setg(errp,
+                   "backend config: remote fields require transport=remote-rdma");
+        return false;
+    }
     if (be->type == SCOPE_BACKEND_VORTEX && (!have_socket || have_bdf)) {
         error_setg(errp, "backend config: vortex requires bridge-socket and forbids real-host-bdf");
         return false;
     }
+    if (be->type == SCOPE_BACKEND_IXGBE) {
+        error_setg(errp,
+                   "backend config: ixgbe is supported only with "
+                   "transport=remote-rdma");
+        return false;
+    }
     if (be->type != SCOPE_BACKEND_VORTEX && (!have_bdf || have_socket)) {
-        error_setg(errp, "backend config: nvme/igb require real-host-bdf and forbid bridge-socket");
+        error_setg(errp, "backend config: local nvme/igb require "
+                   "real-host-bdf and forbid bridge-socket");
         return false;
     }
     if (have_gds_nvme &&
@@ -756,6 +1061,20 @@ static bool scope_parse_backend_config(ScopeProxyState *s, Error **errp)
                                 s->backends[s->backend_count].real_host_bdf)) {
                         error_setg(errp, "backend config: duplicate BDF %s",
                                    s->backends[i].real_host_bdf);
+                        return false;
+                    }
+                    if (s->backends[i].remote_device_id &&
+                        s->backends[s->backend_count].remote_device_id &&
+                        !strcmp(s->backends[i].remote_device_id,
+                                s->backends[s->backend_count].remote_device_id) &&
+                        s->backends[i].remote_host &&
+                        s->backends[s->backend_count].remote_host &&
+                        !strcmp(s->backends[i].remote_host,
+                                s->backends[s->backend_count].remote_host)) {
+                        error_setg(errp,
+                                   "backend config: duplicate remote device %s@%s",
+                                   s->backends[i].remote_device_id,
+                                   s->backends[i].remote_host);
                         return false;
                     }
                 }
@@ -1482,6 +1801,24 @@ static void scope_vcfg_init_igb_endpoint(ScopeVswitchConfigFn *fn,
     scope_vcfg_w1c_range(fn, pcie_cap + PCI_EXP_DEVSTA, 2);
 }
 
+static void scope_vcfg_init_ixgbe_endpoint(ScopeVswitchConfigFn *fn,
+                                           uint16_t bdf)
+{
+    const uint8_t pcie_cap = 0x70;
+
+    scope_vcfg_init_igb_endpoint(fn, bdf, SCOPE_IXGBE_BAR0_SIZE);
+    pci_config_set_device_id(fn->config, 0x10fb);
+    pci_set_word(fn->config + PCI_SUBSYSTEM_VENDOR_ID, 0x8086);
+    pci_set_word(fn->config + PCI_SUBSYSTEM_ID, 0x000c);
+    fn->config[PCI_REVISION_ID] = 0x01;
+    pci_set_long(fn->config + pcie_cap + PCI_EXP_LNKCAP,
+                 PCI_EXP_LNKCAP_SLS_5_0GB |
+                 QEMU_PCI_EXP_LNKCAP_MLW(QEMU_PCI_EXP_LNK_X8));
+    pci_set_word(fn->config + pcie_cap + PCI_EXP_LNKSTA,
+                 PCI_EXP_LNKSTA_CLS_5_0GB |
+                 QEMU_PCI_EXP_LNKSTA_NLW(QEMU_PCI_EXP_LNK_X8));
+}
+
 static void scope_vcfg_init_vortex_endpoint(ScopeVswitchConfigFn *fn,
                                             uint16_t bdf)
 {
@@ -1538,6 +1875,8 @@ static void scope_vcfg_init_all(ScopeProxyState *s, PCIDevice *pci_dev)
         if (be->type == SCOPE_BACKEND_IGB) {
             scope_vcfg_init_igb_endpoint(ep, SCOPE_VSWITCH_EP_BDF(i),
                                          be->real_bar0_size);
+        } else if (be->type == SCOPE_BACKEND_IXGBE) {
+            scope_vcfg_init_ixgbe_endpoint(ep, SCOPE_VSWITCH_EP_BDF(i));
         } else if (be->type == SCOPE_BACKEND_VORTEX) {
             scope_vcfg_init_vortex_endpoint(ep, SCOPE_VSWITCH_EP_BDF(i));
         } else {
@@ -1596,10 +1935,15 @@ static bool scope_sync_ecam_shadow_range_locked(ScopeProxyState *s, int index,
     for (pos = start; pos < end; pos += 4) {
         uint32_t word = ldl_le_p(fn->config + pos);
         uint32_t shadow_off = index * SCOPE_VSWITCH_ECAM_FUNC_SIZE + pos;
-        if (s->ecam_shadow_map)
-            *(volatile uint32_t *)((uint8_t *)s->ecam_shadow_map + shadow_off) = word;
-        else if (!scope_xdma_write32_locked(s, HOST_ECAM_SHADOW_BASE + shadow_off, word))
+        if (s->ecam_shadow_map) {
+            *(volatile uint32_t *)((uint8_t *)s->ecam_shadow_map +
+                                   shadow_off) = word;
+        } else if (!scope_xdma_write32_locked(s,
+                                              HOST_ECAM_SHADOW_BASE +
+                                              shadow_off,
+                                              word)) {
             return false;
+        }
     }
 
     return true;
@@ -1647,21 +1991,31 @@ static bool scope_sync_ecam_shadow_fence(ScopeProxyState *s, int index,
                                          uint32_t offset)
 {
     uint32_t value;
+    uint32_t expected;
     uint32_t aligned = offset & ~3U;
     uint32_t host_off = HOST_ECAM_SHADOW_BASE +
                         index * SCOPE_VSWITCH_ECAM_FUNC_SIZE + aligned;
     bool ok;
 
     qemu_mutex_lock(&s->xdma_lock);
+    expected = ldl_le_p(s->vcfg[index].config + aligned);
     smp_mb();
     if (s->ecam_shadow_map) {
         value = *(volatile uint32_t *)((uint8_t *)s->ecam_shadow_map +
-                                      index * SCOPE_VSWITCH_ECAM_FUNC_SIZE + aligned);
+                                      index * SCOPE_VSWITCH_ECAM_FUNC_SIZE +
+                                      aligned);
         ok = true;
     } else {
         ok = scope_xdma_read32_locked(s, host_off, &value);
     }
     qemu_mutex_unlock(&s->xdma_lock);
+    if (ok && value != expected) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: ECAM shadow readback mismatch slot=%d "
+                      "offset=0x%03x expected=0x%08x actual=0x%08x\n",
+                      index, aligned, expected, value);
+        return false;
+    }
     return ok;
 }
 
@@ -1714,9 +2068,11 @@ static bool scope_sync_guest_bar_shadow(ScopeProxyState *s,
         (be->real_bar0_size == 0 ||
          base < SCOPE_GUEST_MMIO_BASE ||
          base > SCOPE_GUEST_MMIO_BASE + SCOPE_GUEST_MMIO_SIZE - be->real_bar0_size)) {
-        SCOPE_PRINTF("[SCOPE VSWITCH][ROUTE][INVALID] backend=%u base=0x%016" PRIx64
-                     " size=0x%zx outside PCI MEM window\n",
-                     be->id, base, be->real_bar0_size);
+        if (command & PCI_COMMAND_MEMORY) {
+            SCOPE_PRINTF("[SCOPE VSWITCH][ROUTE][INVALID] backend=%u "
+                         "base=0x%016" PRIx64 " size=0x%zx outside PCI MEM window\n",
+                         be->id, base, be->real_bar0_size);
+        }
         ctrl &= ~ROUTE_CTRL_VALID;
     }
     if (ctrl & ROUTE_CTRL_VALID) {
@@ -1769,6 +2125,15 @@ static bool scope_sync_guest_bar_shadow(ScopeProxyState *s,
         SCOPE_FFLUSH(stdout);
     }
     return ok;
+}
+
+static bool scope_cfg_write_touches_bar_route(uint32_t offset, uint32_t len)
+{
+    uint32_t end = offset + len;
+
+    return (offset < PCI_COMMAND + 2U && end > PCI_COMMAND) ||
+           (offset < PCI_BASE_ADDRESS_0 + 8U &&
+            end > PCI_BASE_ADDRESS_0);
 }
 
 static bool scope_real_bar_write(ScopeProxyState *s, uint32_t offset, uint64_t data,
@@ -2473,6 +2838,7 @@ static bool scope_guest_mem_write(ScopeProxyState *s, uint64_t guest_pa,
 }
 
 #include "scope_fpga_vswitch_igb_backend.c"
+#include "scope_fpga_vswitch_ixgbe_backend.c"
 
 static void scope_capture_admin_seed(ScopeProxyState *s)
 {
@@ -3716,12 +4082,496 @@ static bool scope_patch_io_cmd(ScopeProxyState *s, const ScopeSqState *sq,
     return scope_patch_common_command_buffers(s, cmd, data_len, "io", NULL);
 }
 
+static bool scope_backend_is_remote(const ScopeBackend *be)
+{
+    return be && be->transport == SCOPE_TRANSPORT_REMOTE_RDMA;
+}
+
+static bool scope_remote_add_segment(ScopeProxyState *s,
+                                     struct scope_remote_nvme_submit *submit,
+                                     uint64_t guest_pa, uint64_t length)
+{
+    struct scope_remote_segment *seg;
+    uint32_t count = submit->segment_count;
+    uint64_t ignored;
+
+    if (!length || length > UINT32_MAX ||
+        !scope_guest_range_to_bar_offset(s, guest_pa, length, &ignored)) {
+        return false;
+    }
+    if (count &&
+        submit->segments[count - 1].guest_pa +
+            submit->segments[count - 1].length == guest_pa &&
+        submit->segments[count - 1].length <= UINT32_MAX - length) {
+        submit->segments[count - 1].length += length;
+        return true;
+    }
+    if (count >= SCOPE_REMOTE_MAX_SEGMENTS) {
+        return false;
+    }
+    seg = &submit->segments[count];
+    seg->guest_pa = guest_pa;
+    seg->length = length;
+    submit->segment_count++;
+    return true;
+}
+
+static bool scope_remote_collect_prps(ScopeProxyState *s, const NvmeCmd *cmd,
+                                      uint64_t data_len,
+                                      struct scope_remote_nvme_submit *submit)
+{
+    uint32_t page_size = s->active->ctrl_page_size ?
+        s->active->ctrl_page_size : SCOPE_NVME_DEFAULT_CTRL_PAGE_SIZE;
+    uint64_t page_mask = (uint64_t)page_size - 1U;
+    uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
+    uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
+    uint64_t first_len;
+    uint64_t remaining;
+
+    if (!data_len) {
+        return true;
+    }
+    if (!prp1 || page_size < 4096 || (page_size & page_mask)) {
+        return false;
+    }
+    first_len = scope_min_u64(data_len, page_size - (prp1 & page_mask));
+    if (!scope_remote_add_segment(s, submit, prp1, first_len)) {
+        return false;
+    }
+    remaining = data_len - first_len;
+    if (!remaining) {
+        return true;
+    }
+    if (!prp2 || (prp2 & page_mask)) {
+        return false;
+    }
+    if (remaining <= page_size) {
+        return scope_remote_add_segment(s, submit, prp2, remaining);
+    }
+
+    while (remaining) {
+        uint64_t *entries;
+        uint64_t list_offset;
+        uint32_t entries_per_page = page_size / sizeof(uint64_t);
+        uint64_t pages_left = scope_div_round_up_u64(remaining, page_size);
+        uint32_t data_entries = MIN(pages_left,
+                                    (uint64_t)entries_per_page);
+        bool chained = pages_left > entries_per_page;
+        uint64_t next_list = 0;
+        uint32_t i;
+
+        if (chained) {
+            data_entries--;
+        }
+        if (!data_entries ||
+            !scope_guest_range_to_bar_offset(s, prp2, page_size,
+                                             &list_offset)) {
+            return false;
+        }
+        entries = g_new(uint64_t, entries_per_page);
+        if (!scope_guest_mem_read(s, prp2, entries, page_size)) {
+            g_free(entries);
+            return false;
+        }
+        for (i = 0; i < data_entries; i++) {
+            uint64_t addr = le64_to_cpu(entries[i]);
+            uint64_t len = scope_min_u64(remaining, page_size);
+
+            if (!addr || (addr & page_mask) ||
+                !scope_remote_add_segment(s, submit, addr, len)) {
+                g_free(entries);
+                return false;
+            }
+            remaining -= len;
+        }
+        if (chained) {
+            next_list = le64_to_cpu(entries[entries_per_page - 1]);
+            if (!next_list || (next_list & page_mask)) {
+                g_free(entries);
+                return false;
+            }
+        }
+        g_free(entries);
+        prp2 = next_list;
+    }
+    return true;
+}
+
+static uint32_t scope_remote_admin_data_len(const NvmeCmd *cmd)
+{
+    if (cmd->opcode == NVME_ADM_CMD_IDENTIFY) {
+        return NVME_IDENTIFY_DATA_SIZE;
+    }
+    if (cmd->opcode == NVME_ADM_CMD_GET_LOG_PAGE) {
+        uint64_t numd = ((uint64_t)(le32_to_cpu(cmd->cdw11) & 0xffffU) << 16) |
+                        (le32_to_cpu(cmd->cdw10) >> 16);
+
+        return numd < (UINT32_MAX / 4U) ? (uint32_t)((numd + 1U) * 4U) : 0;
+    }
+    return 0;
+}
+
+static uint32_t scope_remote_direction(const NvmeCmd *cmd, uint16_t qid)
+{
+    if (qid == SCOPE_ADMIN_QID) {
+        if (cmd->opcode == NVME_ADM_CMD_IDENTIFY ||
+            cmd->opcode == NVME_ADM_CMD_GET_LOG_PAGE) {
+            return SCOPE_REMOTE_IO_FROM_DEVICE;
+        }
+        return SCOPE_REMOTE_IO_NONE;
+    }
+    switch (cmd->opcode) {
+    case NVME_CMD_READ:
+        return SCOPE_REMOTE_IO_FROM_DEVICE;
+    case NVME_CMD_WRITE:
+    case NVME_CMD_COMPARE:
+    case NVME_CMD_DSM:
+        return SCOPE_REMOTE_IO_TO_DEVICE;
+    default:
+        return SCOPE_REMOTE_IO_NONE;
+    }
+}
+
+static bool scope_prepare_remote_admin_op(ScopeProxyState *s,
+                                          const NvmeCmd *cmd,
+                                          ScopePendingAdminOp *op)
+{
+    uint64_t ignored;
+
+    memset(op, 0, sizeof(*op));
+    switch (cmd->opcode) {
+    case NVME_ADM_CMD_CREATE_CQ: {
+        const NvmeCreateCq *cq = (const NvmeCreateCq *)cmd;
+        uint16_t qid = le16_to_cpu(cq->cqid);
+        uint16_t depth = le16_to_cpu(cq->qsize) + 1U;
+        uint64_t base = le64_to_cpu(cq->prp1);
+
+        if (!qid || qid >= SCOPE_MAX_NVME_QUEUES || !depth ||
+            !NVME_CQ_FLAGS_PC(le16_to_cpu(cq->cq_flags)) ||
+            !scope_guest_range_to_bar_offset(s, base,
+                                             (uint64_t)depth * sizeof(NvmeCqe),
+                                             &ignored)) {
+            return false;
+        }
+        op->valid = true;
+        op->type = SCOPE_ADMIN_TOPO_OP_CREATE_CQ;
+        op->qid = qid;
+        op->depth = depth;
+        op->interrupt_enabled =
+            NVME_CQ_FLAGS_IEN(le16_to_cpu(cq->cq_flags));
+        op->guest_base = base;
+        return true;
+    }
+    case NVME_ADM_CMD_CREATE_SQ: {
+        const NvmeCreateSq *sq = (const NvmeCreateSq *)cmd;
+        uint16_t qid = le16_to_cpu(sq->sqid);
+        uint16_t cqid = le16_to_cpu(sq->cqid);
+        uint16_t depth = le16_to_cpu(sq->qsize) + 1U;
+        uint64_t base = le64_to_cpu(sq->prp1);
+
+        if (!qid || qid >= SCOPE_MAX_NVME_QUEUES || !cqid ||
+            cqid >= SCOPE_MAX_NVME_QUEUES || !depth ||
+            !NVME_SQ_FLAGS_PC(le16_to_cpu(sq->sq_flags)) ||
+            !scope_guest_range_to_bar_offset(s, base,
+                                             (uint64_t)depth * sizeof(NvmeCmd),
+                                             &ignored)) {
+            return false;
+        }
+        op->valid = true;
+        op->type = SCOPE_ADMIN_TOPO_OP_CREATE_SQ;
+        op->qid = qid;
+        op->cqid = cqid;
+        op->depth = depth;
+        op->guest_base = base;
+        return true;
+    }
+    case NVME_ADM_CMD_DELETE_CQ:
+    case NVME_ADM_CMD_DELETE_SQ: {
+        const NvmeDeleteQ *del = (const NvmeDeleteQ *)cmd;
+        uint16_t qid = le16_to_cpu(del->qid);
+
+        if (!qid || qid >= SCOPE_MAX_NVME_QUEUES) {
+            return false;
+        }
+        op->valid = true;
+        op->type = cmd->opcode == NVME_ADM_CMD_DELETE_CQ ?
+            SCOPE_ADMIN_TOPO_OP_DELETE_CQ : SCOPE_ADMIN_TOPO_OP_DELETE_SQ;
+        op->qid = qid;
+        return true;
+    }
+    case NVME_ADM_CMD_IDENTIFY: {
+        const NvmeIdentify *id = (const NvmeIdentify *)cmd;
+
+        if (id->cns == NVME_ID_CNS_NS && le32_to_cpu(id->nsid)) {
+            op->valid = true;
+            op->type = SCOPE_ADMIN_TOPO_OP_IDENTIFY_NS;
+            op->nsid = le32_to_cpu(id->nsid);
+            op->data_guest_base = le64_to_cpu(id->prp1);
+        }
+        return true;
+    }
+    default:
+        return true;
+    }
+}
+
+static ScopeRemoteRequest *scope_remote_alloc_request(ScopeBackend *be,
+                                                       uint64_t request_id)
+{
+    uint32_t i;
+
+    if (be->remote_inflight >= be->remote_max_inflight) {
+        return NULL;
+    }
+    for (i = 0; i < SCOPE_REMOTE_MAX_INFLIGHT; i++) {
+        if (!be->remote_req[i].valid) {
+            memset(&be->remote_req[i], 0, sizeof(be->remote_req[i]));
+            be->remote_req[i].valid = true;
+            be->remote_req[i].request_id = request_id;
+            be->remote_inflight++;
+            return &be->remote_req[i];
+        }
+    }
+    return NULL;
+}
+
+static ScopeRemoteRequest *scope_remote_find_request(ScopeBackend *be,
+                                                      uint64_t request_id)
+{
+    uint32_t i;
+
+    for (i = 0; i < SCOPE_REMOTE_MAX_INFLIGHT; i++) {
+        if (be->remote_req[i].valid &&
+            be->remote_req[i].request_id == request_id) {
+            return &be->remote_req[i];
+        }
+    }
+    return NULL;
+}
+
+static void scope_remote_release_request(ScopeBackend *be,
+                                         ScopeRemoteRequest *req)
+{
+    if (!req || !req->valid) {
+        return;
+    }
+    memset(req, 0, sizeof(*req));
+    if (be->remote_inflight) {
+        be->remote_inflight--;
+    }
+}
+
+static bool scope_remote_prepare_payload(ScopeProxyState *s,
+                                         ScopeBackend *be,
+                                         ScopeRemoteRequest *req,
+                                         struct scope_remote_nvme_submit *wire)
+{
+    uint8_t *staging;
+    uint64_t staging_base;
+    uint32_t staging_size;
+    uint32_t offset = 0;
+    uint32_t i;
+
+    req->direction = wire->direction;
+    req->segment_count = wire->segment_count;
+    memcpy(req->segments, wire->segments,
+           wire->segment_count * sizeof(wire->segments[0]));
+    if (!scope_remote_uses_host_staging(be->remote)) {
+        return true;
+    }
+
+    staging = scope_remote_staging_data(be->remote);
+    staging_base = scope_remote_payload_base(be->remote);
+    staging_size = scope_remote_payload_size(be->remote);
+    if (!staging || wire->data_len > staging_size) {
+        return false;
+    }
+    for (i = 0; i < wire->segment_count; i++) {
+        uint32_t length = wire->segments[i].length;
+
+        if (!length || length > wire->data_len - offset) {
+            return false;
+        }
+        if (wire->direction == SCOPE_REMOTE_IO_TO_DEVICE &&
+            !scope_guest_mem_read(s, wire->segments[i].guest_pa,
+                                  staging + offset, length)) {
+            return false;
+        }
+        wire->segments[i].guest_pa = staging_base + offset;
+        offset += length;
+    }
+    if (offset != wire->data_len) {
+        return false;
+    }
+    smp_wmb();
+    return true;
+}
+
+static bool scope_remote_finish_payload(ScopeProxyState *s,
+                                        ScopeBackend *be,
+                                        ScopeRemoteRequest *req,
+                                        const ScopeRemoteEvent *event)
+{
+    uint8_t *staging;
+    uint32_t offset = 0;
+    uint32_t i;
+
+    if (!scope_remote_uses_host_staging(be->remote) ||
+        req->direction != SCOPE_REMOTE_IO_FROM_DEVICE ||
+        (event->u.nvme.status & ~1U)) {
+        return true;
+    }
+    if (event->u.nvme.transferred != req->data_len) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: remote staging transfer length mismatch "
+                      "backend=%u request=%" PRIu64 " expected=%u got=%u\n",
+                      be->id, req->request_id, req->data_len,
+                      event->u.nvme.transferred);
+        return false;
+    }
+    staging = scope_remote_staging_data(be->remote);
+    if (!staging || req->data_len > scope_remote_payload_size(be->remote)) {
+        return false;
+    }
+    smp_rmb();
+    for (i = 0; i < req->segment_count; i++) {
+        uint32_t length = req->segments[i].length;
+
+        if (!length || length > req->data_len - offset ||
+            !scope_guest_mem_write(s, req->segments[i].guest_pa,
+                                   staging + offset, length)) {
+            return false;
+        }
+        offset += length;
+    }
+    return offset == req->data_len;
+}
+
+static ScopeSqeReadStatus scope_process_remote_sq_entries(
+    ScopeProxyState *s, ScopeSqState *sq, uint16_t new_tail,
+    bool allow_stable_seed)
+{
+    ScopeBackend *be = s->active;
+    uint16_t cursor;
+
+    if (!sq->valid || !sq->depth || new_tail >= sq->depth ||
+        !be->remote || be->remote_failed_state) {
+        return SCOPE_SQE_READ_ERR;
+    }
+    cursor = sq->last_guest_tail;
+    while (cursor != new_tail) {
+        struct scope_remote_nvme_submit submit = { 0 };
+        ScopePendingAdminOp admin_op = { 0 };
+        ScopeRemoteRequest *req;
+        NvmeCmd cmd;
+        uint64_t cmd_pa = sq->guest_base + (uint64_t)cursor * sizeof(cmd);
+        uint64_t request_id;
+        uint64_t data_len;
+        uint16_t cid;
+        Error *local_err = NULL;
+
+        if (be->remote_inflight >= be->remote_max_inflight) {
+            return SCOPE_SQE_READ_WAIT;
+        }
+        if (sq->qid == SCOPE_ADMIN_QID) {
+            ScopeSqeReadStatus read_status = scope_read_admin_sqe_stable(
+                s, sq, cursor, cmd_pa, &cmd, allow_stable_seed);
+
+            if (read_status != SCOPE_SQE_READ_OK) {
+                return read_status;
+            }
+            if (!scope_prepare_remote_admin_op(s, &cmd, &admin_op)) {
+                return SCOPE_SQE_READ_ERR;
+            }
+            data_len = scope_remote_admin_data_len(&cmd);
+        } else {
+            if (!scope_guest_mem_read(s, cmd_pa, &cmd, sizeof(cmd))) {
+                return SCOPE_SQE_READ_ERR;
+            }
+            data_len = scope_io_cmd_data_len(s, &cmd);
+        }
+        if (data_len > UINT32_MAX ||
+            (be->remote_max_transfer_bytes &&
+             data_len > be->remote_max_transfer_bytes)) {
+            return SCOPE_SQE_READ_ERR;
+        }
+        memcpy(submit.command, &cmd, sizeof(cmd));
+        submit.qid = sq->qid;
+        submit.direction = scope_remote_direction(&cmd, sq->qid);
+        submit.data_len = data_len;
+        if (data_len &&
+            !scope_remote_collect_prps(s, &cmd, data_len, &submit)) {
+            SCOPE_PRINTF("[SCOPE REMOTE][PRP][ERR] backend=%u qid=%u cid=%u "
+                         "bytes=%" PRIu64 "\n",
+                         be->id, sq->qid, le16_to_cpu(cmd.cid), data_len);
+            return SCOPE_SQE_READ_ERR;
+        }
+
+        request_id = ++be->remote_next_request_id;
+        if (!request_id) {
+            request_id = ++be->remote_next_request_id;
+        }
+        req = scope_remote_alloc_request(be, request_id);
+        if (!req) {
+            be->remote_failed_state = true;
+            return SCOPE_SQE_READ_ERR;
+        }
+        cid = le16_to_cpu(cmd.cid);
+        req->qid = sq->qid;
+        req->cid = cid;
+        req->sq_head = (cursor + 1U) % sq->depth;
+        req->cqid = sq->linked_cqid;
+        req->data_len = data_len;
+        req->submitted_us = g_get_monotonic_time();
+        if (!scope_remote_prepare_payload(s, be, req, &submit)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SCOPE: remote payload staging failed backend=%u "
+                          "qid=%u cid=%u bytes=%" PRIu64 "\n",
+                          be->id, sq->qid, cid, data_len);
+            scope_remote_release_request(be, req);
+            return SCOPE_SQE_READ_ERR;
+        }
+        if (!scope_remote_submit_nvme(be->remote, &submit, request_id,
+                                      &local_err)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SCOPE: remote NVMe submit failed: %s\n",
+                          local_err ? error_get_pretty(local_err) : "unknown");
+            error_free(local_err);
+            scope_remote_release_request(be, req);
+            be->remote_failed_state = true;
+            return SCOPE_SQE_READ_ERR;
+        }
+        if (sq->qid == SCOPE_ADMIN_QID) {
+            if (admin_op.valid) {
+                scope_stage_pending_admin_op(s, cid, &admin_op);
+            }
+            if (!be->admin_cid_outstanding[cid]) {
+                be->admin_cid_outstanding[cid] = true;
+                be->admin_outstanding_count++;
+            }
+        }
+        SCOPE_PRINTF("[SCOPE REMOTE][NVME][SUBMIT] backend=%u request=%" PRIu64
+                     " qid=%u cid=%u bytes=%" PRIu64 " segments=%u\n",
+                     be->id, request_id, sq->qid, cid, data_len,
+                     submit.segment_count);
+        cursor = (cursor + 1U) % sq->depth;
+        /* Commit each submitted SQE so a flow-control retry cannot replay it. */
+        sq->last_guest_tail = cursor;
+    }
+    return SCOPE_SQE_READ_OK;
+}
+
 static ScopeSqeReadStatus scope_process_new_sq_entries(ScopeProxyState *s,
                                                        ScopeSqState *sq,
                                                        uint16_t new_tail,
                                                        bool allow_stable_seed)
 {
     uint16_t cursor;
+
+    if (scope_backend_is_remote(s->active)) {
+        return scope_process_remote_sq_entries(s, sq, new_tail,
+                                               allow_stable_seed);
+    }
 
     if (!sq->valid || !sq->depth || new_tail >= sq->depth) {
         SCOPE_PRINTF("[SCOPE PROXY][SQ][ERR] invalid SQ state qid=%u valid=%d depth=%u "
@@ -4055,6 +4905,169 @@ static bool scope_cq_has_pending(const ScopeCqState *cq)
     return cq->valid && cq->interrupt_enabled && (cq->shadow_tail != cq->last_guest_head);
 }
 
+static bool scope_remote_publish_completion(ScopeProxyState *s,
+                                            const ScopeRemoteEvent *event)
+{
+    ScopeBackend *be = s->active;
+    ScopeRemoteRequest *req =
+        scope_remote_find_request(be, event->request_id);
+    ScopeCqState *cq;
+    NvmeCqe cqe = { 0 };
+    uint64_t guest_pa;
+    int64_t latency_us;
+    uint16_t wire_status;
+
+    if (!req || event->type != SCOPE_REMOTE_EVENT_NVME_COMPLETE ||
+        event->u.nvme.sq_id != req->qid || event->u.nvme.cid != req->cid ||
+        req->cqid >= SCOPE_MAX_NVME_QUEUES) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: unmatched remote completion backend=%u "
+                      "request=%" PRIu64 " qid=%u cid=%u\n",
+                      be->id, event->request_id, event->u.nvme.sq_id,
+                      event->u.nvme.cid);
+        be->remote_failed_state = true;
+        return false;
+    }
+    cq = &be->cq[req->cqid];
+    if (!cq->valid || !cq->depth ||
+        ((cq->shadow_tail + 1U) % cq->depth) == cq->last_guest_head) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: remote CQ is unavailable/full backend=%u cqid=%u\n",
+                      be->id, req->cqid);
+        be->remote_failed_state = true;
+        return false;
+    }
+    if (!scope_remote_finish_payload(s, be, req, event)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: remote completion payload publish failed "
+                      "backend=%u request=%" PRIu64 "\n",
+                      be->id, event->request_id);
+        be->remote_failed_state = true;
+        return false;
+    }
+
+    wire_status = event->u.nvme.status & ~1U;
+    cqe.result = cpu_to_le32(event->u.nvme.result);
+    cqe.sq_head = cpu_to_le16(req->sq_head);
+    cqe.sq_id = cpu_to_le16(req->qid);
+    cqe.cid = cpu_to_le16(req->cid);
+    cqe.status = cpu_to_le16(wire_status | (cq->phase ? 1U : 0U));
+    guest_pa = cq->guest_base + (uint64_t)cq->shadow_tail * sizeof(cqe);
+    if (!scope_publish_guest_cqe_for_cpu(s, cq, guest_pa, &cqe)) {
+        be->remote_failed_state = true;
+        return false;
+    }
+
+    if (req->qid == SCOPE_ADMIN_QID) {
+        if (be->admin_cid_outstanding[req->cid]) {
+            be->admin_cid_outstanding[req->cid] = false;
+            if (be->admin_outstanding_count) {
+                be->admin_outstanding_count--;
+            }
+        }
+        scope_commit_pending_admin_op(s, &cqe);
+    }
+    cq->shadow_tail++;
+    if (cq->shadow_tail == cq->depth) {
+        cq->shadow_tail = 0;
+        cq->phase = !cq->phase;
+    }
+    be->intx_pending = scope_cq_has_pending(cq);
+    latency_us = g_get_monotonic_time() - req->submitted_us;
+    scope_remote_release_request(be, req);
+    be->remote_completed++;
+    SCOPE_PRINTF("[SCOPE REMOTE][NVME][COMPLETE] backend=%u request=%" PRIu64
+                 " qid=%u cid=%u status=0x%04x bytes=%u latency_us=%" PRId64
+                 "\n", be->id, event->request_id, event->u.nvme.sq_id,
+                 event->u.nvme.cid, event->u.nvme.status,
+                 event->u.nvme.transferred,
+                 latency_us);
+    return true;
+}
+
+static bool scope_remote_backend_poll(ScopeProxyState *s)
+{
+    ScopeBackend *be = s->active;
+    bool progressed = false;
+    int64_t now_us;
+    uint32_t timeout_ms;
+    uint32_t i;
+
+    if (!scope_backend_is_remote(be) || !be->remote ||
+        be->remote_failed_state) {
+        return false;
+    }
+    now_us = g_get_monotonic_time();
+    timeout_ms = scope_remote_request_timeout_ms(be->remote);
+    for (i = 0; timeout_ms && i < SCOPE_REMOTE_MAX_INFLIGHT; i++) {
+        ScopeRemoteRequest *req = &be->remote_req[i];
+
+        if (req->valid && now_us - req->submitted_us >=
+                          (int64_t)timeout_ms * 1000) {
+            uint32_t j;
+
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SCOPE: remote request timed out backend=%u "
+                          "request=%" PRIu64 " qid=%u cid=%u timeout_ms=%u\n",
+                          be->id, req->request_id, req->qid, req->cid,
+                          timeout_ms);
+            for (j = 0; j < SCOPE_REMOTE_MAX_INFLIGHT; j++) {
+                ScopeRemoteRequest *failed_req = &be->remote_req[j];
+                ScopeRemoteEvent failed_event = { 0 };
+
+                if (!failed_req->valid) {
+                    continue;
+                }
+                failed_event.type = SCOPE_REMOTE_EVENT_NVME_COMPLETE;
+                failed_event.request_id = failed_req->request_id;
+                failed_event.u.nvme.sq_id = failed_req->qid;
+                failed_event.u.nvme.cid = failed_req->cid;
+                failed_event.u.nvme.status =
+                    (uint16_t)(NVME_INTERNAL_DEV_ERROR << 1);
+                if (!scope_remote_publish_completion(s, &failed_event)) {
+                    break;
+                }
+                progressed = true;
+            }
+            be->remote_failed_state = true;
+            be->remote_failed++;
+            return progressed;
+        }
+    }
+    for (;;) {
+        ScopeRemoteEvent event;
+        Error *local_err = NULL;
+
+        if (!scope_remote_poll(be->remote, &event, &local_err)) {
+            if (local_err) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "SCOPE: remote-rdma poll failed: %s\n",
+                              error_get_pretty(local_err));
+                error_free(local_err);
+                be->remote_failed_state = true;
+                be->remote_failed++;
+            }
+            break;
+        }
+        progressed = true;
+        if (event.type == SCOPE_REMOTE_EVENT_FAILED || local_err) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SCOPE: remote-rdma backend %u failed: %s\n",
+                          be->id, local_err ? error_get_pretty(local_err) :
+                          "peer failure");
+            error_free(local_err);
+            be->remote_failed_state = true;
+            be->remote_failed++;
+            break;
+        }
+        if (event.type == SCOPE_REMOTE_EVENT_NVME_COMPLETE &&
+            !scope_remote_publish_completion(s, &event)) {
+            break;
+        }
+    }
+    return progressed;
+}
+
 static void scope_update_virtual_intx(ScopeProxyState *s)
 {
     bool pending = false;
@@ -4066,11 +5079,24 @@ static void scope_update_virtual_intx(ScopeProxyState *s)
     for (b = 0; b < s->backend_count; b++) {
         bool backend_pending = false;
         s->active = &s->backends[b];
-        if (s->active->type == SCOPE_BACKEND_IGB) {
+        if (s->active->type == SCOPE_BACKEND_IGB ||
+            s->active->type == SCOPE_BACKEND_IXGBE) {
             pending |= s->active->intx_pending;
             continue;
         }
         if (NVME_CC_EN(s->active->guest_cc)) {
+            if (scope_backend_is_remote(s->active)) {
+                for (i = 0; i < SCOPE_MAX_NVME_QUEUES; i++) {
+                    backend_pending |= scope_cq_has_pending(
+                        &s->active->cq[i]);
+                }
+                if (s->active->guest_int_mask & 0x1U) {
+                    backend_pending = false;
+                }
+                s->active->intx_pending = backend_pending;
+                pending |= backend_pending;
+                continue;
+            }
             for (i = 0; i < SCOPE_MAX_NVME_QUEUES; i++) {
                 bool advanced = false;
                 if (!scope_refresh_cq_shadow_tail(s, &s->active->cq[i], &advanced))
@@ -4292,14 +5318,17 @@ static void scope_try_process_pending_sq_doorbell(ScopeProxyState *s)
                  pending.new_tail);
     SCOPE_FFLUSH(stdout);
 
-    ok = scope_real_bar_write(s, pending.offset & ~0x3U, pending.data,
+    ok = scope_backend_is_remote(s->active) ||
+         scope_real_bar_write(s, pending.offset & ~0x3U, pending.data,
                               pending.wstrb, pending.size_bytes);
     flags = ((uint32_t)pending.size_bytes << 8) | pending.wstrb;
     scope_log_bar_write(s, pending.seq, pending.offset, flags, pending.size_bytes,
                         pending.wstrb, pending.data, ok);
     if (ok) {
-        SCOPE_PRINTF("[SCOPE PROXY][DB][FORWARD_REAL_DB] backend=%u qid=%u "
+        SCOPE_PRINTF("[SCOPE PROXY][DB][%s] backend=%u qid=%u "
                      "seq=%u off=0x%04x new_tail=%u\n",
+                     scope_backend_is_remote(s->active) ?
+                     "REMOTE_SUBMITTED" : "FORWARD_REAL_DB",
                      s->active->id, pending.qid, pending.seq, pending.offset,
                      pending.new_tail);
         SCOPE_FFLUSH(stdout);
@@ -4401,7 +5430,8 @@ static bool scope_handle_doorbell_write(ScopeProxyState *s, uint32_t offset, uin
         scope_update_virtual_intx(s);
     }
 
-    if (!scope_real_bar_write(s, aligned_offset, data, wstrb, size_bytes)) {
+    if (!scope_backend_is_remote(s->active) &&
+        !scope_real_bar_write(s, aligned_offset, data, wstrb, size_bytes)) {
         SCOPE_PRINTF("[SCOPE PROXY][DB][ERR] failed to forward real doorbell off=0x%04x "
                "aligned=0x%04x data=0x%016" PRIx64 " wstrb=0x%02x\n",
                offset, aligned_offset, data, wstrb);
@@ -4437,7 +5467,9 @@ static bool scope_handle_nvme_bar_write(ScopeProxyState *s, uint32_t offset, uin
             scope_update_shadow_u64(&s->active->guest_asq, aligned_offset == (NVME_REG_ASQ + 4),
                                     dword_data, wstrb);
         }
-        return scope_sync_admin_regs_to_real(s);
+        return scope_backend_is_remote(s->active) ?
+               scope_refresh_admin_queue_state(s) :
+               scope_sync_admin_regs_to_real(s);
     }
 
     if (qword_offset == NVME_REG_ACQ) {
@@ -4447,7 +5479,9 @@ static bool scope_handle_nvme_bar_write(ScopeProxyState *s, uint32_t offset, uin
             scope_update_shadow_u64(&s->active->guest_acq, aligned_offset == (NVME_REG_ACQ + 4),
                                     dword_data, wstrb);
         }
-        return scope_sync_admin_regs_to_real(s);
+        return scope_backend_is_remote(s->active) ?
+               scope_refresh_admin_queue_state(s) :
+               scope_sync_admin_regs_to_real(s);
     }
 
     switch (aligned_offset) {
@@ -4456,10 +5490,13 @@ static bool scope_handle_nvme_bar_write(ScopeProxyState *s, uint32_t offset, uin
 
         s->active->guest_cc = scope_apply_wstrb32(s->active->guest_cc, dword_data, dword_wstrb);
         scope_update_ctrl_page_size(s);
-        if (!scope_sync_admin_regs_to_real(s)) {
+        if (!scope_backend_is_remote(s->active) &&
+            !scope_sync_admin_regs_to_real(s)) {
             return false;
         }
-        if (NVME_CC_EN(s->active->guest_cc)) {
+        if (scope_backend_is_remote(s->active)) {
+            /* The remote agent exposes semantic queues, not guest ASQ/ACQ. */
+        } else if (NVME_CC_EN(s->active->guest_cc)) {
             if (!scope_real_bar_write32(s, NVME_REG_CC, s->active->guest_cc)) {
                 return false;
             }
@@ -4480,18 +5517,22 @@ static bool scope_handle_nvme_bar_write(ScopeProxyState *s, uint32_t offset, uin
     }
     case NVME_REG_AQA:
         s->active->guest_aqa = scope_apply_wstrb32(s->active->guest_aqa, dword_data, dword_wstrb);
-        return scope_sync_admin_regs_to_real(s);
+        return scope_backend_is_remote(s->active) ? true :
+               scope_sync_admin_regs_to_real(s);
 
     case NVME_REG_INTMS:
         s->active->guest_int_mask |= scope_apply_wstrb32(0, dword_data, dword_wstrb);
         scope_update_virtual_intx(s);
-        return scope_real_bar_write(s, aligned_offset, data, wstrb, size_bytes);
+        return scope_backend_is_remote(s->active) ? true :
+               scope_real_bar_write(s, aligned_offset, data, wstrb, size_bytes);
     case NVME_REG_INTMC:
         s->active->guest_int_mask &= ~scope_apply_wstrb32(0, dword_data, dword_wstrb);
         scope_update_virtual_intx(s);
-        return scope_real_bar_write(s, aligned_offset, data, wstrb, size_bytes);
+        return scope_backend_is_remote(s->active) ? true :
+               scope_real_bar_write(s, aligned_offset, data, wstrb, size_bytes);
     default:
-        return scope_real_bar_write(s, aligned_offset, data, wstrb, size_bytes);
+        return scope_backend_is_remote(s->active) ? true :
+               scope_real_bar_write(s, aligned_offset, data, wstrb, size_bytes);
     }
 }
 
@@ -4533,8 +5574,25 @@ static bool scope_handle_nvme_bar_read(ScopeProxyState *s, uint32_t offset, uint
         *data = scope_pack_dword32_for_offset(s->active->guest_int_mask, offset);
         return true;
     case NVME_REG_CSTS:
+        if (scope_backend_is_remote(s->active)) {
+            uint32_t csts = 0;
+
+            if (NVME_CC_EN(s->active->guest_cc) &&
+                !s->active->remote_failed_state) {
+                csts |= 1U; /* RDY */
+            }
+            if (s->active->remote_failed_state) {
+                csts |= 2U; /* CFS */
+            }
+            *data = scope_pack_dword32_for_offset(csts, offset);
+            return true;
+        }
         return scope_real_bar_read(s, aligned_offset, size_bytes, data);
     default:
+        if (scope_backend_is_remote(s->active)) {
+            *data = 0;
+            return true;
+        }
         return scope_real_bar_read(s, aligned_offset, size_bytes, data);
     }
 }
@@ -4734,13 +5792,18 @@ static void scope_process_cfg_packet(ScopeProxyState *s, const struct scope_dma3
         ScopeBackend *be = &s->backends[backend_id];
 
         if (actual_addr + (uint32_t)len <= config_limit) {
+            bool route_dirty =
+                scope_cfg_write_touches_bar_route(actual_addr, len);
+
             scope_vcfg_write_masked(fn, actual_addr, val, len);
 
             sync_ok = scope_sync_ecam_shadow_range(s, shadow_index,
                                                    actual_addr, len,
                                                    &local_err) &&
-                      scope_sync_guest_bar_shadow(s, fn, be, &local_err) &&
-                      scope_sync_ecam_shadow_fence(s, shadow_index, actual_addr);
+                      (!route_dirty ||
+                       scope_sync_guest_bar_shadow(s, fn, be, &local_err)) &&
+                      scope_sync_ecam_shadow_fence(s, shadow_index,
+                                                   actual_addr);
 
             if (!sync_ok && local_err) {
                 qemu_log_mask(LOG_GUEST_ERROR, "SCOPE: %s\n",
@@ -5060,13 +6123,82 @@ static bool scope_init_nvme_capability_cache(ScopeProxyState *s, Error **errp)
 
 static bool scope_nvme_backend_realize(ScopeProxyState *s, Error **errp)
 {
+    ScopeBackend *be = s->active;
+
+    if (scope_backend_is_remote(be)) {
+        ScopeRemoteConfig config = {
+            .host = be->remote_host,
+            .service = be->remote_service,
+            .device_id = be->remote_device_id,
+            .rdma_device = be->rdma_device,
+            .peer_memory_device = be->peer_memory_device,
+            .memory_mode = be->remote_memory_mode,
+            .host_staging_size = be->remote_staging_size,
+            .namespace_id = be->remote_namespace_id,
+            .device_type = SCOPE_REMOTE_DEVICE_NVME,
+            .guest_ddr_base = s->guest_ddr_base,
+            .guest_ddr_size = s->guest_ddr_size,
+            .coherent_alias_base = s->bypass_coherent_alias_base,
+        };
+        struct scope_remote_device_info info = { 0 };
+
+        be->remote = scope_remote_connect(&config, &info, errp);
+        if (!be->remote) {
+            return false;
+        }
+        if (info.class_code != 0x010802U || !info.bar0_size ||
+            info.bar0_size > SCOPE_RP_BAR_APERTURE_SIZE ||
+            (info.bar0_size & (info.bar0_size - 1U))) {
+            error_setg(errp,
+                       "remote-rdma device is not a supported NVMe endpoint");
+            return false;
+        }
+        if (scope_remote_uses_host_staging(be->remote) &&
+            info.max_transfer_bytes >
+                scope_remote_payload_size(be->remote)) {
+            error_setg(errp,
+                       "remote-rdma agent transfer limit exceeds Host A "
+                       "staging MR size");
+            return false;
+        }
+        be->real_bar0_size = info.bar0_size;
+        be->real_bar0_flags = IORESOURCE_MEM;
+        be->nvme_cap = info.nvme_cap;
+        be->nvme_vs = info.nvme_vs;
+        be->ctrl_page_size = info.controller_page_size;
+        be->doorbell_stride = 4U << NVME_CAP_DSTRD(be->nvme_cap);
+        be->remote_max_transfer_bytes = info.max_transfer_bytes;
+        be->remote_max_inflight = MIN(info.max_inflight,
+                                      SCOPE_REMOTE_MAX_INFLIGHT);
+        if (scope_remote_uses_host_staging(be->remote)) {
+            be->remote_max_inflight = 1;
+        }
+        be->remote_next_request_id = 0;
+        g_hash_table_insert(be->ns_lba_shift_map,
+                            GUINT_TO_POINTER(be->remote_namespace_id),
+                            GUINT_TO_POINTER(info.lba_shift));
+        SCOPE_PRINTF("[SCOPE REMOTE][READY] backend=%u virtual=%02x:00.0 "
+                     "host=%s service=%s device=%s rdma=%s session=%" PRIu64
+                     " generation=%" PRIu64 " memory=%s lba_shift=%u max_io=%u "
+                     "max_inflight=%u\n",
+                     be->id, 3U + be->id, be->remote_host,
+                     be->remote_service, be->remote_device_id,
+                     be->rdma_device, scope_remote_session_id(be->remote),
+                     scope_remote_generation(be->remote),
+                     scope_remote_uses_host_staging(be->remote) ?
+                     "host-staging(extra-qemu-copy)" : "peer-dmabuf-direct",
+                     info.lba_shift,
+                     info.max_transfer_bytes, be->remote_max_inflight);
+        return true;
+    }
     return scope_init_nvme_capability_cache(s, errp) &&
            scope_real_nvme_disable(s, "qemu startup", errp);
 }
 
 static void scope_nvme_backend_cleanup(ScopeProxyState *s, ScopeBackend *be)
 {
-    /* Common manager cleanup owns BAR mappings and allocated queue state. */
+    scope_remote_disconnect(be->remote);
+    be->remote = NULL;
 }
 
 static void scope_proxy_cleanup(ScopeProxyState *s)
@@ -5128,6 +6260,11 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
             g_free(be->real_host_bdf);
             g_free(be->bridge_socket);
             g_free(be->gds_nvme_bdf);
+            g_free(be->remote_host);
+            g_free(be->remote_service);
+            g_free(be->remote_device_id);
+            g_free(be->rdma_device);
+            g_free(be->peer_memory_device);
         }
     }
     if (s->xdma_bypass_fd >= 0) {
@@ -5174,7 +6311,6 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
         error_setg(errp, "Property guest-ddr-size is required");
         return;
     }
-
     if (!scope_parse_backend_config(s, errp)) goto fail;
     for (i = 0; i < s->backend_count; i++) {
         ScopeBackend *be = &s->backends[i];
@@ -5183,6 +6319,8 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
         be->real_bar_fd = -1;
         if (be->type == SCOPE_BACKEND_IGB) {
             be->ops = &scope_igb_backend_ops;
+        } else if (be->type == SCOPE_BACKEND_IXGBE) {
+            be->ops = &scope_ixgbe_backend_ops;
         } else if (be->type == SCOPE_BACKEND_VORTEX) {
             be->ops = &scope_vortex_backend_ops;
         } else {
@@ -5213,12 +6351,13 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
             !s->active->ops->preflight(s, errp)) {
             goto fail;
         }
-        if (s->active->ops->requires_real_pci) {
+        if (s->active->ops->requires_real_pci &&
+            !scope_backend_is_remote(s->active)) {
             if (!scope_enable_real_pci_bus_master(s, errp) ||
                 !scope_parse_real_bar0(s, errp)) {
                 goto fail;
             }
-        } else {
+        } else if (!scope_backend_is_remote(s->active)) {
             s->active->real_bar0_size = SCOPE_VORTEX_BAR0_SIZE;
             s->active->real_bar0_flags = IORESOURCE_MEM;
         }
@@ -5253,11 +6392,13 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     s->bar_resp_toggle =
         (bar_resp_ctrl >> BAR_RESP_CTRL_TOGGLE_SHIFT) & 1U;
 
-    s->ecam_shadow_map = mmap(NULL, HOST_ECAM_SHADOW_SIZE, PROT_READ | PROT_WRITE,
-                              MAP_SHARED, s->xdma_fd, HOST_ECAM_SHADOW_BASE);
+    s->ecam_shadow_map = mmap(NULL, HOST_ECAM_SHADOW_SIZE,
+                              PROT_READ | PROT_WRITE, MAP_SHARED,
+                              s->xdma_fd, HOST_ECAM_SHADOW_BASE);
     if (s->ecam_shadow_map == MAP_FAILED) {
         s->ecam_shadow_map = NULL;
-        error_setg_errno(errp, errno, "Failed to mmap ECAM shadow window");
+        error_setg_errno(errp, errno,
+                         "Failed to mmap FPGA ECAM shadow aperture");
         goto fail;
     }
 
@@ -5338,13 +6479,17 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     s->rx_thread_started = true;
 
     SCOPE_PRINTF("[SCOPE PROXY] Active backends=%u\n", s->backend_count);
-    for (i = 0; i < s->backend_count; i++)
+    for (i = 0; i < s->backend_count; i++) {
+        const ScopeBackend *be = &s->backends[i];
+        const char *transport =
+            be->transport == SCOPE_TRANSPORT_REMOTE_RDMA ?
+            "remote-rdma" : "local-p2p";
+
         SCOPE_PRINTF("[SCOPE PROXY] backend=%u type=%s virtual=%02x:00.0 "
                      "transport=%s BAR0=0x%zx\n",
-                     i, s->backends[i].ops->name,
-                     3 + i, s->backends[i].real_host_bdf ?
-                     s->backends[i].real_host_bdf : s->backends[i].bridge_socket,
-                     s->backends[i].real_bar0_size);
+                     i, be->ops->name, 3 + i, transport,
+                     be->real_bar0_size);
+    }
     SCOPE_PRINTF("[SCOPE PROXY] FPGA bypass BAR%d @ 0x%016" PRIx64 ", size=0x%016" PRIx64 "\n",
            s->fpga_bypass_bar_index, s->fpga_bypass_bar_base, s->fpga_bypass_bar_size);
     SCOPE_PRINTF("[SCOPE PROXY] Real DMA coherent alias offset=0x%016" PRIx64 "\n",

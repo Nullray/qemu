@@ -71,10 +71,10 @@ static void scope_nvme_backend_process_bar_packet(
 static bool scope_nvme_backend_poll(ScopeProxyState *s, int64_t now_us)
 {
     ScopeBackend *be = s->active;
-    bool progressed = false;
+    bool progressed = scope_remote_backend_poll(s);
 
     if (!be->pending_sq_db.valid) {
-        return false;
+        return progressed;
     }
     if (now_us - be->last_pending_log_us >= 1000000) {
         SCOPE_PRINTF("[SCOPE PROXY][DB][PENDING] backend=%u qid=%u seq=%u "
