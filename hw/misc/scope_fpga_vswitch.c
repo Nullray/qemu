@@ -14,6 +14,8 @@
 #include "hw/misc/scope_fpga_vswitch_abi.h"
 #include "hw/misc/scope_fpga_vswitch_rdma.h"
 #include "hw/misc/scope_vortex_bridge_proto.h"
+#include "hw/misc/scope_vortex_gids_abi.h"
+#include "hw/misc/scope_vortex_gids_queue.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -337,7 +339,15 @@ typedef struct ScopeRemoteRequest {
 typedef struct ScopeIgbState ScopeIgbState;
 typedef struct ScopeIxgbeState ScopeIxgbeState;
 typedef struct ScopeVortexState ScopeVortexState;
+typedef struct ScopeGidsService ScopeGidsService;
 typedef struct ScopeBackendOps ScopeBackendOps;
+
+static bool scope_gids_service_realize(ScopeProxyState *s,
+                                       ScopeVortexState *v, Error **errp);
+static bool scope_gids_service_poll(ScopeGidsService *g);
+static void scope_gids_service_cleanup(ScopeGidsService *g);
+static bool scope_gids_service_bar_read(ScopeGidsService *g, uint32_t off,
+                                        uint32_t *value);
 
 typedef struct ScopeBackend {
     ScopeBackendType type;
@@ -348,6 +358,7 @@ typedef struct ScopeBackend {
     char *real_host_bdf;
     char *bridge_socket;
     char *gds_nvme_bdf;
+    char *gids_nvme_bdf;
     char *remote_host;
     char *remote_service;
     char *remote_device_id;
@@ -366,6 +377,14 @@ typedef struct ScopeBackend {
     uint64_t remote_failed;
     bool remote_failed_state;
     bool vortex_direct_p2p;
+    bool gids_enabled;
+    uint32_t gids_nsid;
+    uint64_t gids_slba_base;
+    uint64_t gids_block_count;
+    uint64_t gids_control_base;
+    uint64_t gids_control_size;
+    uint32_t gids_queue_depth;
+    uint64_t gids_payload_size;
     int real_bar_fd;
     void *real_bar0_map;
     size_t real_bar0_size;
@@ -397,6 +416,7 @@ typedef struct ScopeBackend {
     ScopeIgbState *igb;
     ScopeIxgbeState *ixgbe;
     ScopeVortexState *vortex;
+    ScopeGidsService *gids;
 } ScopeBackend;
 
 struct ScopeBackendOps {
@@ -417,6 +437,8 @@ static const ScopeBackendOps scope_vortex_backend_ops;
 static bool scope_nvme_backend_realize(ScopeProxyState *s, Error **errp);
 static void scope_nvme_backend_cleanup(ScopeProxyState *s, ScopeBackend *be);
 static bool scope_recover_missing_bar_done(ScopeProxyState *s, int64_t now_us);
+static bool scope_parse_real_bar0(ScopeProxyState *s, Error **errp);
+static bool scope_init_nvme_capability_cache(ScopeProxyState *s, Error **errp);
 
 struct ScopeProxyState {
     PCIDevice parent_obj;
@@ -579,6 +601,50 @@ static bool scope_json_uint32(ScopeJsonCursor *j, uint32_t *value,
     return true;
 }
 
+/* Large addresses may be written as a JSON number or as a quoted 0x string. */
+static bool scope_json_uint64_flexible(ScopeJsonCursor *j, uint64_t *value,
+                                       Error **errp)
+{
+    uint64_t parsed = 0;
+
+    scope_json_ws(j);
+    if (j->pos < j->len && j->buf[j->pos] == '"') {
+        g_autofree char *text = scope_json_string(j, errp);
+        char *end = NULL;
+
+        if (!text) {
+            return false;
+        }
+        errno = 0;
+        parsed = g_ascii_strtoull(text, &end, 0);
+        if (errno == ERANGE || !end || end == text || *end) {
+            error_setg(errp, "backend config: invalid uint64 value '%s'",
+                       text);
+            return false;
+        }
+        *value = parsed;
+        return true;
+    }
+
+    if (j->pos >= j->len || !g_ascii_isdigit(j->buf[j->pos])) {
+        error_setg(errp,
+                   "backend config: expected unsigned integer at byte %zu",
+                   j->pos);
+        return false;
+    }
+    while (j->pos < j->len && g_ascii_isdigit(j->buf[j->pos])) {
+        unsigned int digit = j->buf[j->pos++] - '0';
+
+        if (parsed > (UINT64_MAX - digit) / 10U) {
+            error_setg(errp, "backend config: integer exceeds uint64 range");
+            return false;
+        }
+        parsed = parsed * 10U + digit;
+    }
+    *value = parsed;
+    return true;
+}
+
 static bool scope_valid_host_bdf(const char *s)
 {
     unsigned int domain, bus, dev, fn;
@@ -596,6 +662,15 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
     bool have_type = false;
     bool have_data_path = false;
     bool have_gds_nvme = false;
+    bool have_gids_mode = false;
+    bool have_gids_nvme = false;
+    bool have_gids_nsid = false;
+    bool have_gids_slba = false;
+    bool have_gids_blocks = false;
+    bool have_gids_control_base = false;
+    bool have_gids_control_size = false;
+    bool have_gids_depth = false;
+    bool have_gids_payload = false;
     bool have_transport = false;
     bool have_remote_host = false;
     bool have_remote_service = false;
@@ -611,6 +686,9 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
     be->remote_namespace_id = 1;
     be->remote_memory_mode = SCOPE_REMOTE_MEMORY_PEER_DMABUF;
     be->remote_staging_size = SCOPE_REMOTE_DEFAULT_STAGING_SIZE;
+    be->gids_nsid = 1;
+    be->gids_queue_depth = 64;
+    be->gids_payload_size = 8U * 1024U * 1024U;
 
     if (!scope_json_ch(j, '{', errp)) {
         return false;
@@ -864,6 +942,93 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                 }
                 be->gds_nvme_bdf = g_steal_pointer(&value);
                 have_gds_nvme = true;
+            } else if (!strcmp(key, "gids-mode")) {
+                if (have_gids_mode) {
+                    error_setg(errp, "backend config: duplicate gids-mode");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value || strcmp(value, "mediated")) {
+                    error_setg(errp,
+                               "backend config: gids-mode must be 'mediated'");
+                    return false;
+                }
+                be->gids_enabled = true;
+                have_gids_mode = true;
+            } else if (!strcmp(key, "gids-nvme-bdf")) {
+                if (have_gids_nvme) {
+                    error_setg(errp,
+                               "backend config: duplicate gids-nvme-bdf");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value || !scope_valid_host_bdf(value)) {
+                    if (!*errp) {
+                        error_setg(errp,
+                                   "backend config: invalid GIDS NVMe BDF '%s'",
+                                   value ? value : "");
+                    }
+                    return false;
+                }
+                be->gids_nvme_bdf = g_steal_pointer(&value);
+                have_gids_nvme = true;
+            } else if (!strcmp(key, "gids-nsid")) {
+                if (have_gids_nsid ||
+                    !scope_json_uint32(j, &be->gids_nsid, errp) ||
+                    !be->gids_nsid || be->gids_nsid == NVME_NSID_BROADCAST) {
+                    if (!*errp) {
+                        error_setg(errp,
+                                   "backend config: gids-nsid must be concrete");
+                    }
+                    return false;
+                }
+                have_gids_nsid = true;
+            } else if (!strcmp(key, "gids-slba-base")) {
+                if (have_gids_slba ||
+                    !scope_json_uint64_flexible(j, &be->gids_slba_base,
+                                                errp)) {
+                    return false;
+                }
+                have_gids_slba = true;
+            } else if (!strcmp(key, "gids-block-count")) {
+                if (have_gids_blocks ||
+                    !scope_json_uint64_flexible(j, &be->gids_block_count,
+                                                errp) ||
+                    !be->gids_block_count) {
+                    if (!*errp) {
+                        error_setg(errp,
+                                   "backend config: gids-block-count must be nonzero");
+                    }
+                    return false;
+                }
+                have_gids_blocks = true;
+            } else if (!strcmp(key, "gids-control-base")) {
+                if (have_gids_control_base ||
+                    !scope_json_uint64_flexible(j, &be->gids_control_base,
+                                                errp)) {
+                    return false;
+                }
+                have_gids_control_base = true;
+            } else if (!strcmp(key, "gids-control-size")) {
+                if (have_gids_control_size ||
+                    !scope_json_uint64_flexible(j, &be->gids_control_size,
+                                                errp)) {
+                    return false;
+                }
+                have_gids_control_size = true;
+            } else if (!strcmp(key, "gids-queue-depth")) {
+                if (have_gids_depth ||
+                    !scope_json_uint32(j, &be->gids_queue_depth, errp)) {
+                    return false;
+                }
+                have_gids_depth = true;
+            } else if (!strcmp(key, "gids-payload-size")) {
+                if (have_gids_payload ||
+                    !scope_json_uint64_flexible(j, &be->gids_payload_size,
+                                                errp)) {
+                    return false;
+                }
+                have_gids_payload = true;
             } else {
                 error_setg(errp, "backend config: unknown device key '%s'", key);
                 return false;
@@ -890,7 +1055,10 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                        "backend config: remote-rdma supports nvme or ixgbe");
             return false;
         }
-        if (have_bdf || have_socket || have_data_path || have_gds_nvme) {
+        if (have_bdf || have_socket || have_data_path || have_gds_nvme ||
+            have_gids_mode || have_gids_nvme || have_gids_nsid ||
+            have_gids_slba || have_gids_blocks || have_gids_control_base ||
+            have_gids_control_size || have_gids_depth || have_gids_payload) {
             error_setg(errp,
                        "backend config: remote-rdma forbids local BDF/socket/GDS fields");
             return false;
@@ -967,6 +1135,30 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                    "backend config: gds-nvme-bdf requires a direct-p2p "
                    "Vortex backend");
         return false;
+    }
+    if (have_gids_mode || have_gids_nvme || have_gids_nsid ||
+        have_gids_slba || have_gids_blocks || have_gids_control_base ||
+        have_gids_control_size || have_gids_depth || have_gids_payload) {
+        if (be->type != SCOPE_BACKEND_VORTEX || !be->vortex_direct_p2p ||
+            !have_gids_mode || !have_gids_nvme || !have_gids_blocks ||
+            !have_gids_control_base || !have_gids_control_size) {
+            error_setg(errp,
+                       "backend config: GIDS requires a direct-p2p Vortex "
+                       "backend and gids-mode/nvme-bdf/block-count/control-base/control-size");
+            return false;
+        }
+        if (have_gds_nvme ||
+            !scope_gids_depth_valid(be->gids_queue_depth) ||
+            be->gids_payload_size < 4096U ||
+            (be->gids_payload_size & 4095U) ||
+            be->gids_control_size < 64U * 1024U ||
+            (be->gids_control_base & 4095U) ||
+            (be->gids_control_size & 4095U) ||
+            be->gids_control_base > UINT64_MAX - be->gids_control_size) {
+            error_setg(errp,
+                       "backend config: invalid or conflicting GIDS queue/control settings");
+            return false;
+        }
     }
     return true;
 }
@@ -1110,13 +1302,14 @@ static bool scope_parse_backend_config(ScopeProxyState *s, Error **errp)
     }
     {
         unsigned int vortex_gds_count = 0;
+        unsigned int vortex_gids_count = 0;
 
         for (unsigned int i = 0; i < s->backend_count; i++) {
             ScopeBackend *vortex = &s->backends[i];
             bool found_nvme = false;
 
             if (!vortex->gds_nvme_bdf) {
-                continue;
+                goto check_gids;
             }
             vortex_gds_count++;
             for (unsigned int n = 0; n < s->backend_count; n++) {
@@ -1137,11 +1330,50 @@ static bool scope_parse_backend_config(ScopeProxyState *s, Error **errp)
                            vortex->gds_nvme_bdf);
                 return false;
             }
+check_gids:
+            if (vortex->gids_enabled) {
+                uint64_t ddr_end;
+
+                vortex_gids_count++;
+                if (s->guest_ddr_base > UINT64_MAX - s->guest_ddr_size ||
+                    vortex->gids_control_base >
+                        UINT64_MAX - vortex->gids_control_size) {
+                    error_setg(errp,
+                               "backend config: GIDS DDR/control range overflows");
+                    return false;
+                }
+                ddr_end = s->guest_ddr_base + s->guest_ddr_size;
+                if (vortex->gids_control_base < s->guest_ddr_base ||
+                    vortex->gids_control_base + vortex->gids_control_size >
+                        ddr_end) {
+                    error_setg(errp,
+                               "backend config: GIDS control range is outside guest DDR");
+                    return false;
+                }
+                for (unsigned int n = 0; n < s->backend_count; n++) {
+                    ScopeBackend *other = &s->backends[n];
+
+                    if (other->real_host_bdf &&
+                        !strcmp(other->real_host_bdf,
+                                vortex->gids_nvme_bdf)) {
+                        error_setg(errp,
+                                   "backend config: GIDS controller %s must be "
+                                   "exclusive and cannot be an exposed backend",
+                                   vortex->gids_nvme_bdf);
+                        return false;
+                    }
+                }
+            }
         }
         if (vortex_gds_count > 1) {
             error_setg(errp,
                        "backend config: only one GDS Vortex/NVMe pair is "
                        "currently supported");
+            return false;
+        }
+        if (vortex_gids_count > 1) {
+            error_setg(errp,
+                       "backend config: only one GIDS service is currently supported");
             return false;
         }
     }
@@ -5599,6 +5831,7 @@ static bool scope_handle_nvme_bar_read(ScopeProxyState *s, uint32_t offset, uint
 
 #include "scope_fpga_vswitch_nvme_backend.c"
 #include "scope_fpga_vswitch_vortex_backend.c"
+#include "scope_fpga_vswitch_gids.c"
 
 static bool scope_read_stable_packet(const void *slot_base,
                                      struct scope_dma32_packet *pkt)
@@ -6260,6 +6493,7 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
             g_free(be->real_host_bdf);
             g_free(be->bridge_socket);
             g_free(be->gds_nvme_bdf);
+            g_free(be->gids_nvme_bdf);
             g_free(be->remote_host);
             g_free(be->remote_service);
             g_free(be->remote_device_id);

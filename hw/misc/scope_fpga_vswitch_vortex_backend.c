@@ -57,6 +57,29 @@
 #define SCOPE_VX_GDS_MAX_SIZE_LO       0x25cU
 #define SCOPE_VX_GDS_MAX_SIZE_HI       0x260U
 
+/* Read-only discovery block for the GPU-owned logical GIDS queue. */
+#define SCOPE_VX_GIDS_CAPS             0x280U
+#define SCOPE_VX_GIDS_STATE            0x284U
+#define SCOPE_VX_GIDS_ERROR            0x288U
+#define SCOPE_VX_GIDS_HANDLE           0x28cU
+#define SCOPE_VX_GIDS_DEPTH            0x290U
+#define SCOPE_VX_GIDS_GENERATION_LO    0x294U
+#define SCOPE_VX_GIDS_GENERATION_HI    0x298U
+#define SCOPE_VX_GIDS_HEADER_LO        0x29cU
+#define SCOPE_VX_GIDS_HEADER_HI        0x2a0U
+#define SCOPE_VX_GIDS_SQ_LO            0x2a4U
+#define SCOPE_VX_GIDS_SQ_HI            0x2a8U
+#define SCOPE_VX_GIDS_CQ_LO            0x2acU
+#define SCOPE_VX_GIDS_CQ_HI            0x2b0U
+#define SCOPE_VX_GIDS_PAYLOAD_LO       0x2b4U
+#define SCOPE_VX_GIDS_PAYLOAD_HI       0x2b8U
+#define SCOPE_VX_GIDS_PAYLOAD_SIZE_LO  0x2bcU
+#define SCOPE_VX_GIDS_PAYLOAD_SIZE_HI  0x2c0U
+#define SCOPE_VX_GIDS_NSID             0x2c4U
+#define SCOPE_VX_GIDS_LBA_SHIFT        0x2c8U
+#define SCOPE_VX_GIDS_BLOCKS_LO        0x2ccU
+#define SCOPE_VX_GIDS_BLOCKS_HI        0x2d0U
+
 #define SCOPE_VX_GDS_CMD_ALLOC         1U
 #define SCOPE_VX_GDS_CMD_FREE          2U
 #define SCOPE_VX_GDS_CMD_ARM_READ      3U
@@ -114,6 +137,8 @@ struct ScopeVortexState {
     int socket_fd;
     uint32_t rpc_request_id;
     uint32_t bridge_caps;
+    QemuMutex rpc_lock;
+    bool rpc_lock_inited;
     GAsyncQueue *jobs;
     QemuThread worker;
     bool worker_started;
@@ -212,9 +237,11 @@ static bool scope_vortex_io_full(int fd, void *buf, size_t len, bool write_op)
     return true;
 }
 
-static bool scope_vortex_rpc(ScopeVortexState *v, uint16_t opcode,
-                             const void *request, uint32_t request_len,
-                             void *response, uint32_t response_len)
+static bool scope_vortex_rpc_locked(ScopeVortexState *v, uint16_t opcode,
+                                    const void *request, uint32_t request_len,
+                                    void *response, uint32_t response_capacity,
+                                    uint32_t expected_len,
+                                    uint32_t *actual_len)
 {
     struct scope_vortex_rpc_header req = {
         .magic = SCOPE_VORTEX_RPC_MAGIC,
@@ -225,6 +252,9 @@ static bool scope_vortex_rpc(ScopeVortexState *v, uint16_t opcode,
     };
     struct scope_vortex_rpc_header rsp;
 
+    if (actual_len) {
+        *actual_len = 0;
+    }
     if (!scope_vortex_io_full(v->socket_fd, &req, sizeof(req), true) ||
         (request_len && !scope_vortex_io_full(v->socket_fd, (void *)request,
                                               request_len, true)) ||
@@ -234,14 +264,53 @@ static bool scope_vortex_rpc(ScopeVortexState *v, uint16_t opcode,
     if (rsp.magic != SCOPE_VORTEX_RPC_MAGIC ||
         rsp.version != SCOPE_VORTEX_RPC_VERSION ||
         rsp.opcode != opcode || rsp.request_id != req.request_id ||
-        rsp.status != 0 || rsp.payload_len != response_len) {
+        rsp.status != 0 ||
+        (expected_len != UINT32_MAX && rsp.payload_len != expected_len) ||
+        rsp.payload_len > response_capacity) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "SCOPE VORTEX: RPC op=%u status=%d payload=%u expected=%u\n",
-                      opcode, rsp.status, rsp.payload_len, response_len);
+                      "SCOPE VORTEX: RPC op=%u status=%d payload=%u "
+                      "expected=%u capacity=%u\n",
+                      opcode, rsp.status, rsp.payload_len, expected_len,
+                      response_capacity);
         return false;
     }
-    return !response_len || scope_vortex_io_full(v->socket_fd, response,
-                                                  response_len, false);
+    if (rsp.payload_len &&
+        !scope_vortex_io_full(v->socket_fd, response, rsp.payload_len, false)) {
+        return false;
+    }
+    if (actual_len) {
+        *actual_len = rsp.payload_len;
+    }
+    return true;
+}
+
+static bool scope_vortex_rpc(ScopeVortexState *v, uint16_t opcode,
+                             const void *request, uint32_t request_len,
+                             void *response, uint32_t response_len)
+{
+    bool ok;
+
+    qemu_mutex_lock(&v->rpc_lock);
+    ok = scope_vortex_rpc_locked(v, opcode, request, request_len,
+                                 response, response_len, response_len, NULL);
+    qemu_mutex_unlock(&v->rpc_lock);
+    return ok;
+}
+
+static bool scope_vortex_rpc_variable(ScopeVortexState *v, uint16_t opcode,
+                                      const void *request,
+                                      uint32_t request_len, void *response,
+                                      uint32_t response_capacity,
+                                      uint32_t *response_len)
+{
+    bool ok;
+
+    qemu_mutex_lock(&v->rpc_lock);
+    ok = scope_vortex_rpc_locked(v, opcode, request, request_len,
+                                 response, response_capacity, UINT32_MAX,
+                                 response_len);
+    qemu_mutex_unlock(&v->rpc_lock);
+    return ok;
 }
 
 static bool scope_vortex_rpc_cp_read(ScopeVortexState *v, uint32_t off,
@@ -1394,7 +1463,8 @@ static bool scope_vortex_bar_read(ScopeVortexState *v, uint32_t off,
     case SCOPE_VX_GDS_ALIGNMENT: *value = gds->alignment; return true;
     case SCOPE_VX_GDS_MAX_SIZE_LO: *value = gds->max_size; return true;
     case SCOPE_VX_GDS_MAX_SIZE_HI: *value = gds->max_size >> 32; return true;
-    default: return false;
+    default:
+        return scope_gids_service_bar_read(v->backend->gids, off, value);
     }
 }
 
@@ -1529,8 +1599,18 @@ static void scope_vortex_process_bar_packet(
 static bool scope_vortex_poll(ScopeProxyState *s, int64_t now_us)
 {
     ScopeVortexState *v = s->active->vortex;
+    bool progressed = false;
 
-    return v && v->pending_tail_valid && scope_vortex_try_submit_tail(v);
+    if (!v) {
+        return false;
+    }
+    if (v->pending_tail_valid) {
+        progressed = scope_vortex_try_submit_tail(v) || progressed;
+    }
+    if (s->active->gids) {
+        progressed = scope_gids_service_poll(s->active->gids) || progressed;
+    }
+    return progressed;
 }
 
 static bool scope_vortex_backend_realize(ScopeProxyState *s, Error **errp)
@@ -1543,6 +1623,8 @@ static bool scope_vortex_backend_realize(ScopeProxyState *s, Error **errp)
     v->manager = s;
     v->backend = be;
     v->socket_fd = -1;
+    qemu_mutex_init(&v->rpc_lock);
+    v->rpc_lock_inited = true;
     v->guest_ring_log2 = SCOPE_VX_CP_RING_LOG2;
     v->direct_p2p = be->vortex_direct_p2p;
     if (!scope_vortex_connect(v, be->bridge_socket, errp)) {
@@ -1705,6 +1787,10 @@ static bool scope_vortex_backend_realize(ScopeProxyState *s, Error **errp)
                        "physical queue baseline seq=%u tail=0x%" PRIx64 "\n",
                        v->physical_seq, v->physical_tail);
 
+    if (!scope_gids_service_realize(s, v, errp)) {
+        return false;
+    }
+
     v->jobs = g_async_queue_new();
     qatomic_set(&v->worker_stop, 0);
     qemu_thread_create(&v->worker, "scope-vortex", scope_vortex_worker,
@@ -1737,6 +1823,7 @@ static void scope_vortex_backend_cleanup(ScopeProxyState *s, ScopeBackend *be)
         }
         g_async_queue_unref(v->jobs);
     }
+    scope_gids_service_cleanup(be->gids);
     if (v->socket_fd >= 0) {
         if (s->gds.enabled &&
             s->gds.vortex_backend_id == be->id && s->gds.handle &&
@@ -1757,6 +1844,9 @@ static void scope_vortex_backend_cleanup(ScopeProxyState *s, ScopeBackend *be)
     scope_vortex_trace(v, "cleanup path=%s payload_cpu_bytes=%" PRIu64 "\n",
                        v->direct_p2p ? "direct-p2p" : "mediated",
                        v->payload_cpu_bytes);
+    }
+    if (v->rpc_lock_inited) {
+        qemu_mutex_destroy(&v->rpc_lock);
     }
     g_free(v);
     be->vortex = NULL;
