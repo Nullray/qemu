@@ -10,6 +10,7 @@ typedef struct ScopeRemoteState ScopeRemoteState;
 typedef enum ScopeRemoteMemoryMode {
     SCOPE_REMOTE_MEMORY_PEER_DMABUF = 0,
     SCOPE_REMOTE_MEMORY_HOST_STAGING,
+    SCOPE_REMOTE_MEMORY_INLINE,
 } ScopeRemoteMemoryMode;
 
 typedef struct ScopeRemoteConfig {
@@ -27,6 +28,7 @@ typedef struct ScopeRemoteConfig {
     uint64_t guest_ddr_size;
     uint64_t coherent_alias_base;
     uint32_t device_type;
+    bool ixgbe_shadow_ring;
 } ScopeRemoteConfig;
 
 typedef enum ScopeRemoteEventType {

@@ -366,6 +366,7 @@ typedef struct ScopeBackend {
     char *peer_memory_device;
     ScopeRemoteMemoryMode remote_memory_mode;
     uint32_t remote_staging_size;
+    bool remote_ixgbe_shadow_ring;
     uint32_t remote_namespace_id;
     uint32_t remote_max_transfer_bytes;
     uint32_t remote_max_inflight;
@@ -679,6 +680,7 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
     bool have_peer_device = false;
     bool have_rdma_memory_mode = false;
     bool have_rdma_staging_size = false;
+    bool have_remote_device_mode = false;
     bool have_namespace = false;
 
     be->type = SCOPE_BACKEND_NVME;
@@ -851,6 +853,9 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                 } else if (!strcmp(value, "host-staging")) {
                     be->remote_memory_mode =
                         SCOPE_REMOTE_MEMORY_HOST_STAGING;
+                } else if (!strcmp(value, "inline")) {
+                    be->remote_memory_mode =
+                        SCOPE_REMOTE_MEMORY_INLINE;
                 } else {
                     error_setg(errp,
                                "backend config: unsupported RDMA memory mode '%s'",
@@ -876,6 +881,27 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                     return false;
                 }
                 have_rdma_staging_size = true;
+            } else if (!strcmp(key, "remote-device-mode")) {
+                if (have_remote_device_mode) {
+                    error_setg(errp,
+                               "backend config: duplicate remote-device-mode");
+                    return false;
+                }
+                value = scope_json_string(j, errp);
+                if (!value) {
+                    return false;
+                }
+                if (!strcmp(value, "packet")) {
+                    be->remote_ixgbe_shadow_ring = false;
+                } else if (!strcmp(value, "shadow-ring")) {
+                    be->remote_ixgbe_shadow_ring = true;
+                } else {
+                    error_setg(errp,
+                               "backend config: unsupported remote device mode '%s'",
+                               value);
+                    return false;
+                }
+                have_remote_device_mode = true;
             } else if (!strcmp(key, "namespace-id")) {
                 if (have_namespace) {
                     error_setg(errp, "backend config: duplicate namespace-id");
@@ -1077,10 +1103,11 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
             be->peer_memory_device =
                 g_strdup(SCOPE_REMOTE_DEFAULT_PEER_DEV);
         }
-        if (be->remote_memory_mode == SCOPE_REMOTE_MEMORY_HOST_STAGING &&
+        if (be->remote_memory_mode != SCOPE_REMOTE_MEMORY_PEER_DMABUF &&
             have_peer_device) {
             error_setg(errp,
-                       "backend config: host-staging forbids peer-memory-device");
+                       "backend config: selected memory mode forbids "
+                       "peer-memory-device");
             return false;
         }
         if (be->remote_memory_mode != SCOPE_REMOTE_MEMORY_HOST_STAGING &&
@@ -1091,10 +1118,15 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
             return false;
         }
         if (be->type == SCOPE_BACKEND_IXGBE) {
-            if (be->remote_memory_mode != SCOPE_REMOTE_MEMORY_HOST_STAGING) {
-                error_setg(errp,
-                           "backend config: ixgbe requires "
-                           "rdma-memory-mode=host-staging");
+            ScopeRemoteMemoryMode required_mode =
+                be->remote_ixgbe_shadow_ring ? SCOPE_REMOTE_MEMORY_INLINE :
+                                               SCOPE_REMOTE_MEMORY_HOST_STAGING;
+
+            if (be->remote_memory_mode != required_mode) {
+                error_setg(errp, "backend config: ixgbe mode requires "
+                           "rdma-memory-mode=%s",
+                           be->remote_ixgbe_shadow_ring ? "inline" :
+                                                         "host-staging");
                 return false;
             }
             if (have_namespace || have_peer_device) {
@@ -1103,13 +1135,19 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                            "peer-memory-device");
                 return false;
             }
+        } else if (have_remote_device_mode ||
+                   be->remote_memory_mode == SCOPE_REMOTE_MEMORY_INLINE) {
+            error_setg(errp,
+                       "backend config: remote-device-mode and inline memory "
+                       "are valid only for ixgbe");
+            return false;
         }
         return true;
     }
 
     if (have_remote_host || have_remote_service || have_remote_device ||
         have_rdma_device || have_peer_device || have_rdma_memory_mode ||
-        have_rdma_staging_size || have_namespace) {
+        have_rdma_staging_size || have_remote_device_mode || have_namespace) {
         error_setg(errp,
                    "backend config: remote fields require transport=remote-rdma");
         return false;

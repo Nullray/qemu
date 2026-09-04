@@ -239,6 +239,13 @@ static bool scope_remote_register_payload_mr(ScopeRemoteState *r,
                  IBV_ACCESS_REMOTE_WRITE;
 
     r->memory_mode = config->memory_mode;
+    if (r->memory_mode == SCOPE_REMOTE_MEMORY_INLINE) {
+        r->generation = ((uint64_t)g_random_int() << 32) | g_random_int();
+        if (!r->generation) {
+            r->generation = 1;
+        }
+        return true;
+    }
     if (r->memory_mode == SCOPE_REMOTE_MEMORY_HOST_STAGING) {
         uint32_t size = config->host_staging_size ?
             config->host_staging_size : SCOPE_REMOTE_DEFAULT_HOST_STAGING;
@@ -324,12 +331,21 @@ static bool scope_remote_handshake(ScopeRemoteState *r,
     uint64_t required_features;
 
     if (config->device_type == SCOPE_REMOTE_DEVICE_IXGBE_PACKET) {
-        if (r->memory_mode != SCOPE_REMOTE_MEMORY_HOST_STAGING) {
-            error_setg(errp, "remote ixgbe packet transport requires "
-                       "host-staging mode");
-            return false;
+        if (config->ixgbe_shadow_ring) {
+            if (r->memory_mode != SCOPE_REMOTE_MEMORY_INLINE) {
+                error_setg(errp, "remote ixgbe shadow-ring transport "
+                           "requires inline memory mode");
+                return false;
+            }
+            required_features = SCOPE_REMOTE_IXGBE_SHADOW_FEATURES;
+        } else {
+            if (r->memory_mode != SCOPE_REMOTE_MEMORY_HOST_STAGING) {
+                error_setg(errp, "remote ixgbe packet transport requires "
+                           "host-staging mode");
+                return false;
+            }
+            required_features = SCOPE_REMOTE_IXGBE_FEATURES;
         }
-        required_features = SCOPE_REMOTE_IXGBE_FEATURES;
     } else {
         required_features =
             r->memory_mode == SCOPE_REMOTE_MEMORY_HOST_STAGING ?
@@ -343,7 +359,7 @@ static bool scope_remote_handshake(ScopeRemoteState *r,
     hello->features = cpu_to_le64(required_features);
     hello->peer_base = cpu_to_le64(r->payload_base);
     hello->peer_length = cpu_to_le64(r->payload_size);
-    hello->peer_rkey = cpu_to_le32(r->peer_mr->rkey);
+    hello->peer_rkey = cpu_to_le32(r->peer_mr ? r->peer_mr->rkey : 0);
     hello->max_inflight = cpu_to_le32(64);
     hello->max_segments = cpu_to_le32(SCOPE_REMOTE_MAX_SEGMENTS);
     if (!scope_remote_exchange(r, sizeof(r->tx->hdr) + sizeof(*hello),

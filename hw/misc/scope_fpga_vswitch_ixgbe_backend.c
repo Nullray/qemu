@@ -12,16 +12,24 @@
 #define SCOPE_IXGBE_TX_COMPLETION_DEPTH   64U
 #define SCOPE_IXGBE_TX_WB_MAX             64U
 #define SCOPE_IXGBE_MAX_FRAME             SCOPE_REMOTE_ETHER_MAX_FRAME
+#define SCOPE_IXGBE_REMOTE_EVENT_BUDGET   64U
 
 #define SCOPE_IXGBE_CTRL                  0x00000U
 #define SCOPE_IXGBE_STATUS                0x00008U
 #define SCOPE_IXGBE_CTRL_EXT              0x00018U
+#define SCOPE_IXGBE_ESDP                  0x00020U
 #define SCOPE_IXGBE_I2CCTL                0x00028U
 #define SCOPE_IXGBE_EICR                  0x00800U
 #define SCOPE_IXGBE_EICS                  0x00808U
 #define SCOPE_IXGBE_EIMS                  0x00880U
 #define SCOPE_IXGBE_EIMC                  0x00888U
 #define SCOPE_IXGBE_GPIE                  0x00898U
+#define SCOPE_IXGBE_EICS_EX0              0x00a90U
+#define SCOPE_IXGBE_EICS_EX1              0x00a94U
+#define SCOPE_IXGBE_EIMS_EX0              0x00aa0U
+#define SCOPE_IXGBE_EIMS_EX1              0x00aa4U
+#define SCOPE_IXGBE_EIMC_EX0              0x00ab0U
+#define SCOPE_IXGBE_EIMC_EX1              0x00ab4U
 #define SCOPE_IXGBE_RDBAL0                0x01000U
 #define SCOPE_IXGBE_RDBAH0                0x01004U
 #define SCOPE_IXGBE_RDLEN0                0x01008U
@@ -58,6 +66,7 @@
 #define SCOPE_IXGBE_CTRL_RST_MASK         (SCOPE_IXGBE_CTRL_LNK_RST | \
                                            SCOPE_IXGBE_CTRL_RST)
 #define SCOPE_IXGBE_CTRL_EXT_PFRSTD       0x00004000U
+#define SCOPE_IXGBE_ESDP_SDP2             0x00000004U
 #define SCOPE_IXGBE_I2C_CLK_IN            0x00000001U
 #define SCOPE_IXGBE_I2C_CLK_OUT           0x00000002U
 #define SCOPE_IXGBE_I2C_DATA_IN           0x00000004U
@@ -244,6 +253,8 @@ static void scope_ixgbe_reset_model(ScopeProxyState *s)
     scope_ixgbe_reg_set(x, SCOPE_IXGBE_STATUS, 0);
     scope_ixgbe_reg_set(x, SCOPE_IXGBE_CTRL_EXT,
                         SCOPE_IXGBE_CTRL_EXT_PFRSTD);
+    /* The exported 82599 SFP function always represents an occupied cage. */
+    scope_ixgbe_reg_set(x, SCOPE_IXGBE_ESDP, SCOPE_IXGBE_ESDP_SDP2);
     /* EEPROM present, auto-read complete, 16-bit addressing, 1024 words. */
     scope_ixgbe_reg_set(x, SCOPE_IXGBE_EEC, SCOPE_IXGBE_EEC_VIRTUAL_FIXED);
     /* Firmware is synthetic but valid; no management mode is advertised. */
@@ -292,6 +303,19 @@ static bool scope_ixgbe_read_desc(ScopeProxyState *s, uint64_t pa, void *desc)
            scope_guest_mem_read(s, pa, b, sizeof(b)) &&
            !memcmp(a, b, sizeof(a)) &&
            (memcpy(desc, b, sizeof(b)), true);
+}
+
+static bool scope_ixgbe_publish_desc(ScopeProxyState *s, uint64_t pa,
+                                     const void *desc)
+{
+    uint8_t visible[SCOPE_IXGBE_DESC_SIZE];
+
+    if (!scope_guest_mem_write(s, pa, desc, SCOPE_IXGBE_DESC_SIZE)) {
+        return false;
+    }
+    smp_wmb();
+    return scope_ixgbe_read_desc(s, pa, visible) &&
+           !memcmp(visible, desc, sizeof(visible));
 }
 
 static ScopeIxgbeTxCompletion *scope_ixgbe_tx_completion_reserve(
@@ -369,10 +393,9 @@ static bool scope_ixgbe_complete_tx(ScopeProxyState *s,
         }
         desc.olinfo_status = cpu_to_le32(
             le32_to_cpu(desc.olinfo_status) | SCOPE_IXGBE_ADVTXD_STAT_DD);
-        if (!scope_guest_mem_write(s, c->wb_desc_pa[i], &desc,
-                                   sizeof(desc))) {
+        if (!scope_ixgbe_publish_desc(s, c->wb_desc_pa[i], &desc)) {
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "SCOPE: ixgbe cannot write TX DD for request=%" PRIu64
+                          "SCOPE: ixgbe cannot publish TX DD for request=%" PRIu64
                           " pa=0x%016" PRIx64 "\n",
                           c->request_id, c->wb_desc_pa[i]);
             return false;
@@ -384,9 +407,11 @@ static bool scope_ixgbe_complete_tx(ScopeProxyState *s,
         scope_ixgbe_raise(s, SCOPE_IXGBE_EICR_QUEUE0);
     }
     SCOPE_PRINTF("[SCOPE IXGBE][TX_COMPLETE] backend=%u request=%" PRIu64
-                 " length=%u wb=%u completed=%" PRIu64 "\n",
+                 " length=%u wb=%u completed=%" PRIu64
+                 " causes=0x%08x mask=0x%08x intx=%u\n",
                  s->active->id, c->request_id, c->length, c->wb_count,
-                 x->tx_packets);
+                 x->tx_packets, x->causes, x->mask,
+                 s->active->intx_pending ? 1U : 0U);
     memset(c, 0, sizeof(*c));
     return true;
 }
@@ -545,6 +570,16 @@ static bool scope_ixgbe_deliver_rx(ScopeProxyState *s,
         !(scope_ixgbe_reg_get(x, SCOPE_IXGBE_RXCTRL) &
           SCOPE_IXGBE_RXCTRL_RXEN)) {
         x->dropped_packets++;
+        if (x->dropped_packets <= 8U ||
+            !(x->dropped_packets & (x->dropped_packets - 1U))) {
+            SCOPE_PRINTF("[SCOPE IXGBE][RX_DROP] backend=%u length=%u "
+                         "depth=%u head=%u tail=%u rxdctl=0x%08x "
+                         "rxctrl=0x%08x dropped=%" PRIu64 "\n",
+                         s->active->id, length, depth, head, tail,
+                         scope_ixgbe_reg_get(x, SCOPE_IXGBE_RXDCTL0),
+                         scope_ixgbe_reg_get(x, SCOPE_IXGBE_RXCTRL),
+                         x->dropped_packets);
+        }
         scope_ixgbe_raise(s, SCOPE_IXGBE_EICR_RXO);
         return false;
     }
@@ -559,13 +594,24 @@ static bool scope_ixgbe_deliver_rx(ScopeProxyState *s,
     memset(&desc, 0, sizeof(desc));
     stl_le_p((uint8_t *)&desc + 8, status_error);
     stw_le_p((uint8_t *)&desc + 12, length);
-    if (!scope_guest_mem_write(s, desc_pa, &desc, sizeof(desc))) {
+    if (!scope_ixgbe_publish_desc(s, desc_pa, &desc)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: ixgbe cannot publish RX descriptor "
+                      "pa=0x%016" PRIx64 "\n", desc_pa);
         return false;
     }
     head = (head + 1U) % depth;
     scope_ixgbe_reg_set(x, SCOPE_IXGBE_RDH0, head);
     x->rx_packets++;
     scope_ixgbe_raise(s, SCOPE_IXGBE_EICR_QUEUE0);
+    if (x->rx_packets <= 16U || !(x->rx_packets & (x->rx_packets - 1U))) {
+        SCOPE_PRINTF("[SCOPE IXGBE][RX_DELIVER] backend=%u length=%u "
+                     "head=%u tail=%u received=%" PRIu64
+                     " causes=0x%08x mask=0x%08x intx=%u\n",
+                     s->active->id, length, head, tail, x->rx_packets,
+                     x->causes, x->mask,
+                     s->active->intx_pending ? 1U : 0U);
+    }
     return true;
 }
 
@@ -587,6 +633,16 @@ static bool scope_ixgbe_bar_read(ScopeProxyState *s, uint32_t offset,
         break;
     case SCOPE_IXGBE_EIMS:
         value = x->mask;
+        break;
+    case SCOPE_IXGBE_EICS_EX0:
+        value = x->causes & SCOPE_IXGBE_EICR_QUEUE0;
+        break;
+    case SCOPE_IXGBE_EIMS_EX0:
+        value = x->mask & SCOPE_IXGBE_EICR_QUEUE0;
+        break;
+    case SCOPE_IXGBE_EICS_EX1:
+    case SCOPE_IXGBE_EIMS_EX1:
+        value = 0;
         break;
     case SCOPE_IXGBE_LINKS:
         value = x->link_up ? SCOPE_IXGBE_LINKS_UP |
@@ -657,6 +713,27 @@ static bool scope_ixgbe_bar_write(ScopeProxyState *s, uint32_t offset,
     case SCOPE_IXGBE_EIMC:
         x->mask &= ~(value & SCOPE_IXGBE_SUPPORTED_CAUSES);
         scope_ixgbe_update_intx(s);
+        return true;
+    case SCOPE_IXGBE_EIMS_EX0:
+        if (value & 1U) {
+            x->mask |= SCOPE_IXGBE_EICR_QUEUE0;
+        }
+        scope_ixgbe_update_intx(s);
+        return true;
+    case SCOPE_IXGBE_EIMC_EX0:
+        if (value & 1U) {
+            x->mask &= ~SCOPE_IXGBE_EICR_QUEUE0;
+        }
+        scope_ixgbe_update_intx(s);
+        return true;
+    case SCOPE_IXGBE_EICS_EX0:
+        if (value & 1U) {
+            scope_ixgbe_raise(s, SCOPE_IXGBE_EICR_QUEUE0);
+        }
+        return true;
+    case SCOPE_IXGBE_EICS_EX1:
+    case SCOPE_IXGBE_EIMS_EX1:
+    case SCOPE_IXGBE_EIMC_EX1:
         return true;
     case SCOPE_IXGBE_EICS:
         scope_ixgbe_raise(s, value);
@@ -750,11 +827,12 @@ static bool scope_ixgbe_poll(ScopeProxyState *s, int64_t now_us)
 {
     ScopeIxgbeState *x = s->active->ixgbe;
     bool progressed = false;
+    unsigned int events;
 
     if (!x || !s->active->remote || s->active->remote_failed_state) {
         return false;
     }
-    for (;;) {
+    for (events = 0; events < SCOPE_IXGBE_REMOTE_EVENT_BUDGET; events++) {
         ScopeRemoteEvent event;
         Error *local_err = NULL;
 
@@ -867,8 +945,11 @@ static void scope_ixgbe_process_bar_packet(
 static bool scope_ixgbe_backend_preflight(ScopeProxyState *s, Error **errp)
 {
     if (s->active->transport != SCOPE_TRANSPORT_REMOTE_RDMA ||
-        s->active->remote_memory_mode != SCOPE_REMOTE_MEMORY_HOST_STAGING) {
-        error_setg(errp, "ixgbe backend requires remote-rdma host-staging");
+        s->active->remote_memory_mode !=
+            (s->active->remote_ixgbe_shadow_ring ?
+             SCOPE_REMOTE_MEMORY_INLINE : SCOPE_REMOTE_MEMORY_HOST_STAGING)) {
+        error_setg(errp, "ixgbe backend requires remote-rdma and the memory "
+                   "mode selected by remote-device-mode");
         return false;
     }
     return true;
@@ -888,6 +969,7 @@ static bool scope_ixgbe_backend_realize(ScopeProxyState *s, Error **errp)
         .guest_ddr_base = s->guest_ddr_base,
         .guest_ddr_size = s->guest_ddr_size,
         .coherent_alias_base = s->bypass_coherent_alias_base,
+        .ixgbe_shadow_ring = be->remote_ixgbe_shadow_ring,
     };
     struct scope_remote_device_info info = { 0 };
     ScopeIxgbeState *x;
@@ -908,10 +990,11 @@ static bool scope_ixgbe_backend_realize(ScopeProxyState *s, Error **errp)
     scope_ixgbe_reset_model(s);
     SCOPE_PRINTF("[SCOPE REMOTE][IXGBE][READY] backend=%u virtual=%02x:00.0 "
                  "device=8086:10fb mac=%02x:%02x:%02x:%02x:%02x:%02x "
-                 "mtu=%u link=%s host=%s service=%s\n", be->id,
+                 "mtu=%u link=%s host=%s service=%s mode=%s\n", be->id,
                  3U + be->id, x->mac[0], x->mac[1], x->mac[2], x->mac[3],
                  x->mac[4], x->mac[5], x->mtu, x->link_up ? "up" : "down",
-                 be->remote_host, be->remote_service);
+                 be->remote_host, be->remote_service,
+                 be->remote_ixgbe_shadow_ring ? "shadow-ring" : "packet");
     return true;
 }
 
