@@ -64,6 +64,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 #define SCOPE_INTX_RETRY_INTERVAL_US 500000U
 #define SCOPE_INTX_RETRY_LOW_US      20U
 #define SCOPE_ADMIN_SQE_VISIBILITY_RETRY_US 100U
+#define SCOPE_REMOTE_PRP_VISIBILITY_RETRY_US 100U
+#define SCOPE_REMOTE_PRP_VISIBILITY_TIMEOUT_US 100000U
 #define SCOPE_BAR_DONE_TIMEOUT_US       5000U
 #define SCOPE_DEBUG_IO_PRP_TRACE 0
 #define SCOPE_NVME_DEFAULT_CTRL_PAGE_SIZE 4096U
@@ -100,6 +102,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ScopeProxyState, SCOPE_PROXY)
 #define SCOPE_GDS_MAX_BYTES           (16U * 1024U * 1024U)
 #define SCOPE_GDS_MAX_RESTORE_PAGES   64U
 #define SCOPE_REMOTE_MAX_INFLIGHT      64U
+#define SCOPE_REMOTE_BAR_PENDING_MAX    32U
 #define SCOPE_REMOTE_DEFAULT_SERVICE  "7471"
 #define SCOPE_REMOTE_DEFAULT_PEER_DEV "/dev/xdma0_peer"
 #define SCOPE_REMOTE_DEFAULT_STAGING_SIZE (4U * 1024U * 1024U)
@@ -204,12 +207,25 @@ typedef struct ScopeSqState {
     uint16_t depth;
     uint16_t linked_cqid;
     uint16_t last_guest_tail;
+    bool remote_target_valid;
+    uint16_t remote_target_tail;
+    bool remote_prp_retry_active;
+    uint16_t remote_prp_retry_slot;
+    uint32_t remote_prp_retry_count;
+    int64_t remote_prp_retry_since_us;
+    int64_t remote_prp_next_retry_us;
     uint64_t guest_base;
     uint64_t translated_base;
     bool seed_valid;
     uint64_t seed_guest_pa;
     NvmeCmd seed_cmd;
 } ScopeSqState;
+
+typedef struct ScopeRemotePrpError {
+    const char *reason;
+    uint32_t entry;
+    uint64_t address;
+} ScopeRemotePrpError;
 
 typedef struct ScopeCqState {
     bool valid;
@@ -327,6 +343,8 @@ typedef struct ScopeRemoteRequest {
     uint64_t request_id;
     uint16_t qid;
     uint16_t cid;
+    uint8_t opcode;
+    uint8_t identify_cns;
     uint16_t sq_head;
     uint16_t cqid;
     uint32_t data_len;
@@ -335,6 +353,17 @@ typedef struct ScopeRemoteRequest {
     struct scope_remote_segment segments[SCOPE_REMOTE_MAX_SEGMENTS];
     int64_t submitted_us;
 } ScopeRemoteRequest;
+
+typedef struct ScopeRemoteBarRequest {
+    bool valid;
+    bool write;
+    uint64_t request_id;
+    uint32_t offset;
+    uint32_t size;
+    uint64_t value;
+    uint32_t wstrb;
+    int64_t submitted_us;
+} ScopeRemoteBarRequest;
 
 typedef struct ScopeIgbState ScopeIgbState;
 typedef struct ScopeIxgbeState ScopeIxgbeState;
@@ -367,6 +396,11 @@ typedef struct ScopeBackend {
     ScopeRemoteMemoryMode remote_memory_mode;
     uint32_t remote_staging_size;
     bool remote_ixgbe_shadow_ring;
+    bool remote_nvme_shadow_queue;
+    uint32_t remote_csts;
+    uint32_t remote_committed_cc;
+    bool remote_csts_read_pending;
+    ScopeRemoteBarRequest remote_bar_req[SCOPE_REMOTE_BAR_PENDING_MAX];
     uint32_t remote_namespace_id;
     uint32_t remote_max_transfer_bytes;
     uint32_t remote_max_inflight;
@@ -682,6 +716,7 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
     bool have_rdma_staging_size = false;
     bool have_remote_device_mode = false;
     bool have_namespace = false;
+    g_autofree char *remote_device_mode = NULL;
 
     be->type = SCOPE_BACKEND_NVME;
     be->transport = SCOPE_TRANSPORT_LOCAL_P2P;
@@ -888,19 +923,14 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                     return false;
                 }
                 value = scope_json_string(j, errp);
-                if (!value) {
+                if (!value || !value[0]) {
+                    if (!*errp) {
+                        error_setg(errp,
+                                   "backend config: remote-device-mode is empty");
+                    }
                     return false;
                 }
-                if (!strcmp(value, "packet")) {
-                    be->remote_ixgbe_shadow_ring = false;
-                } else if (!strcmp(value, "shadow-ring")) {
-                    be->remote_ixgbe_shadow_ring = true;
-                } else {
-                    error_setg(errp,
-                               "backend config: unsupported remote device mode '%s'",
-                               value);
-                    return false;
-                }
+                remote_device_mode = g_steal_pointer(&value);
                 have_remote_device_mode = true;
             } else if (!strcmp(key, "namespace-id")) {
                 if (have_namespace) {
@@ -1118,10 +1148,22 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
             return false;
         }
         if (be->type == SCOPE_BACKEND_IXGBE) {
-            ScopeRemoteMemoryMode required_mode =
-                be->remote_ixgbe_shadow_ring ? SCOPE_REMOTE_MEMORY_INLINE :
-                                               SCOPE_REMOTE_MEMORY_HOST_STAGING;
+            ScopeRemoteMemoryMode required_mode;
 
+            if (have_remote_device_mode) {
+                if (!strcmp(remote_device_mode, "packet")) {
+                    be->remote_ixgbe_shadow_ring = false;
+                } else if (!strcmp(remote_device_mode, "shadow-ring")) {
+                    be->remote_ixgbe_shadow_ring = true;
+                } else {
+                    error_setg(errp,
+                               "backend config: ixgbe remote-device-mode must "
+                               "be 'packet' or 'shadow-ring'");
+                    return false;
+                }
+            }
+            required_mode = be->remote_ixgbe_shadow_ring ?
+                SCOPE_REMOTE_MEMORY_INLINE : SCOPE_REMOTE_MEMORY_HOST_STAGING;
             if (be->remote_memory_mode != required_mode) {
                 error_setg(errp, "backend config: ixgbe mode requires "
                            "rdma-memory-mode=%s",
@@ -1135,12 +1177,25 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                            "peer-memory-device");
                 return false;
             }
-        } else if (have_remote_device_mode ||
-                   be->remote_memory_mode == SCOPE_REMOTE_MEMORY_INLINE) {
-            error_setg(errp,
-                       "backend config: remote-device-mode and inline memory "
-                       "are valid only for ixgbe");
-            return false;
+        } else {
+            if (have_remote_device_mode) {
+                if (!strcmp(remote_device_mode, "semantic")) {
+                    be->remote_nvme_shadow_queue = false;
+                } else if (!strcmp(remote_device_mode, "shadow-queue")) {
+                    be->remote_nvme_shadow_queue = true;
+                } else {
+                    error_setg(errp,
+                               "backend config: nvme remote-device-mode must "
+                               "be 'semantic' or 'shadow-queue'");
+                    return false;
+                }
+            }
+            if (be->remote_memory_mode == SCOPE_REMOTE_MEMORY_INLINE) {
+                error_setg(errp,
+                           "backend config: nvme does not support "
+                           "rdma-memory-mode=inline");
+                return false;
+            }
         }
         return true;
     }
@@ -4386,9 +4441,22 @@ static bool scope_remote_add_segment(ScopeProxyState *s,
     return true;
 }
 
+static bool scope_remote_prp_error(ScopeRemotePrpError *error,
+                                   const char *reason, uint32_t entry,
+                                   uint64_t address)
+{
+    if (error) {
+        error->reason = reason;
+        error->entry = entry;
+        error->address = address;
+    }
+    return false;
+}
+
 static bool scope_remote_collect_prps(ScopeProxyState *s, const NvmeCmd *cmd,
                                       uint64_t data_len,
-                                      struct scope_remote_nvme_submit *submit)
+                                      struct scope_remote_nvme_submit *submit,
+                                      ScopeRemotePrpError *error)
 {
     uint32_t page_size = s->active->ctrl_page_size ?
         s->active->ctrl_page_size : SCOPE_NVME_DEFAULT_CTRL_PAGE_SIZE;
@@ -4401,64 +4469,114 @@ static bool scope_remote_collect_prps(ScopeProxyState *s, const NvmeCmd *cmd,
     if (!data_len) {
         return true;
     }
-    if (!prp1 || page_size < 4096 || (page_size & page_mask)) {
-        return false;
+    if (NVME_CMD_FLAGS_PSDT(cmd->flags) != NVME_PSDT_PRP) {
+        return scope_remote_prp_error(error, "unsupported-psdt", 0,
+                                      NVME_CMD_FLAGS_PSDT(cmd->flags));
+    }
+    if (!prp1) {
+        return scope_remote_prp_error(error, "prp1-zero", 0, prp1);
+    }
+    if (page_size < 4096 || (page_size & page_mask)) {
+        return scope_remote_prp_error(error, "invalid-page-size", 0,
+                                      page_size);
     }
     first_len = scope_min_u64(data_len, page_size - (prp1 & page_mask));
     if (!scope_remote_add_segment(s, submit, prp1, first_len)) {
-        return false;
+        return scope_remote_prp_error(error, "prp1-range", 0, prp1);
     }
     remaining = data_len - first_len;
     if (!remaining) {
         return true;
     }
-    if (!prp2 || (prp2 & page_mask)) {
-        return false;
+    if (!prp2) {
+        return scope_remote_prp_error(error, "prp2-zero", 0, prp2);
     }
     if (remaining <= page_size) {
-        return scope_remote_add_segment(s, submit, prp2, remaining);
+        if (prp2 & page_mask) {
+            return scope_remote_prp_error(error, "prp2-data-unaligned", 0,
+                                          prp2);
+        }
+        if (!scope_remote_add_segment(s, submit, prp2, remaining)) {
+            return scope_remote_prp_error(error, "prp2-range", 0, prp2);
+        }
+        return true;
+    }
+
+    /*
+     * PRP2 now points to a PRP list, not a data page.  Linux intentionally
+     * allocates lists for <= 128 KiB I/O from a 256-byte DMA pool, so the
+     * first list may start at an offset within the controller page.  Chained
+     * list pointers remain page aligned.
+     */
+    if (prp2 & (sizeof(uint64_t) - 1U)) {
+        return scope_remote_prp_error(error, "prp-list-unaligned", 0, prp2);
     }
 
     while (remaining) {
         uint64_t *entries;
         uint64_t list_offset;
-        uint32_t entries_per_page = page_size / sizeof(uint64_t);
+        uint32_t entries_in_page =
+            (page_size - (prp2 & page_mask)) / sizeof(uint64_t);
         uint64_t pages_left = scope_div_round_up_u64(remaining, page_size);
         uint32_t data_entries = MIN(pages_left,
-                                    (uint64_t)entries_per_page);
-        bool chained = pages_left > entries_per_page;
+                                    (uint64_t)entries_in_page);
+        bool chained = pages_left > entries_in_page;
+        uint32_t entries_to_read;
+        uint32_t read_length;
         uint64_t next_list = 0;
         uint32_t i;
 
         if (chained) {
             data_entries--;
         }
-        if (!data_entries ||
-            !scope_guest_range_to_bar_offset(s, prp2, page_size,
+        entries_to_read = data_entries + (chained ? 1U : 0U);
+        read_length = entries_to_read * sizeof(uint64_t);
+        /* An initial list at page_size - 8 can contain only a chain link. */
+        if (!entries_to_read ||
+            !scope_guest_range_to_bar_offset(s, prp2, read_length,
                                              &list_offset)) {
-            return false;
+            return scope_remote_prp_error(error, "prp-list-range", 0,
+                                          prp2);
         }
-        entries = g_new(uint64_t, entries_per_page);
-        if (!scope_guest_mem_read(s, prp2, entries, page_size)) {
+        entries = g_new(uint64_t, entries_to_read);
+        if (!scope_guest_mem_read(s, prp2, entries, read_length)) {
             g_free(entries);
-            return false;
+            return scope_remote_prp_error(error, "prp-list-read", 0,
+                                          prp2);
         }
         for (i = 0; i < data_entries; i++) {
             uint64_t addr = le64_to_cpu(entries[i]);
             uint64_t len = scope_min_u64(remaining, page_size);
 
-            if (!addr || (addr & page_mask) ||
-                !scope_remote_add_segment(s, submit, addr, len)) {
+            if (!addr) {
                 g_free(entries);
-                return false;
+                return scope_remote_prp_error(error, "prp-entry-zero", i,
+                                              addr);
+            }
+            if (addr & page_mask) {
+                g_free(entries);
+                return scope_remote_prp_error(error,
+                                              "prp-entry-unaligned", i,
+                                              addr);
+            }
+            if (!scope_remote_add_segment(s, submit, addr, len)) {
+                g_free(entries);
+                return scope_remote_prp_error(error,
+                                              "prp-entry-range-or-limit", i,
+                                              addr);
             }
             remaining -= len;
         }
         if (chained) {
-            next_list = le64_to_cpu(entries[entries_per_page - 1]);
+            next_list = le64_to_cpu(entries[entries_to_read - 1]);
             if (!next_list || (next_list & page_mask)) {
                 g_free(entries);
-                return false;
+                return scope_remote_prp_error(error,
+                                              !next_list ?
+                                              "prp-chain-zero" :
+                                              "prp-chain-unaligned",
+                                              entries_to_read - 1,
+                                              next_list);
             }
         }
         g_free(entries);
@@ -4631,6 +4749,265 @@ static void scope_remote_release_request(ScopeBackend *be,
     }
 }
 
+static ScopeRemoteBarRequest *scope_remote_nvme_shadow_find_bar_req(
+    ScopeBackend *be, uint64_t request_id)
+{
+    uint32_t i;
+
+    for (i = 0; i < SCOPE_REMOTE_BAR_PENDING_MAX; i++) {
+        if (be->remote_bar_req[i].valid &&
+            be->remote_bar_req[i].request_id == request_id) {
+            return &be->remote_bar_req[i];
+        }
+    }
+    return NULL;
+}
+
+static void scope_remote_nvme_shadow_rearm_queued_bar_timeouts(
+    ScopeBackend *be)
+{
+    int64_t now_us = g_get_monotonic_time();
+    uint32_t i;
+
+    /* BAR RPCs are serialized by the transport.  Requests queued behind the
+     * completed RPC must receive a fresh timeout budget before going live. */
+    for (i = 0; i < SCOPE_REMOTE_BAR_PENDING_MAX; i++) {
+        if (be->remote_bar_req[i].valid) {
+            be->remote_bar_req[i].submitted_us = now_us;
+        }
+    }
+}
+
+static bool scope_remote_nvme_shadow_check_bar_timeouts(
+    ScopeProxyState *s, int64_t now_us, uint32_t timeout_ms)
+{
+    ScopeBackend *be = s->active;
+    uint32_t i;
+
+    if (!be->remote_nvme_shadow_queue || !timeout_ms) {
+        return false;
+    }
+    for (i = 0; i < SCOPE_REMOTE_BAR_PENDING_MAX; i++) {
+        ScopeRemoteBarRequest *pending = &be->remote_bar_req[i];
+
+        if (!pending->valid ||
+            now_us - pending->submitted_us < (int64_t)timeout_ms * 1000) {
+            continue;
+        }
+        SCOPE_PRINTF("[SCOPE REMOTE][NVME][BAR][TIMEOUT] backend=%u "
+                     "request=%" PRIu64 " off=0x%04x timeout_ms=%u\n",
+                     be->id, pending->request_id, pending->offset,
+                     timeout_ms);
+        SCOPE_FFLUSH(stdout);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: remote NVMe shadow BAR request timed out "
+                      "backend=%u request=%" PRIu64 " off=0x%04x "
+                      "timeout_ms=%u\n",
+                      be->id, pending->request_id, pending->offset,
+                      timeout_ms);
+        memset(be->remote_bar_req, 0, sizeof(be->remote_bar_req));
+        be->remote_csts_read_pending = false;
+        be->remote_failed_state = true;
+        be->remote_failed++;
+        return true;
+    }
+    return false;
+}
+
+static bool scope_remote_nvme_shadow_submit_bar(ScopeProxyState *s,
+                                                 bool write,
+                                                 uint32_t offset,
+                                                 uint64_t value,
+                                                 uint32_t wstrb,
+                                                 uint32_t size)
+{
+    ScopeBackend *be = s->active;
+    ScopeRemoteBarRequest *pending = NULL;
+    struct scope_remote_bar bar = {
+        .offset = offset,
+        .size = size,
+        .value = value,
+        .wstrb = wstrb,
+    };
+    uint64_t request_id;
+    uint32_t i;
+    Error *local_err = NULL;
+
+    if (!be->remote_nvme_shadow_queue) {
+        return true;
+    }
+    if (!be->remote || be->remote_failed_state) {
+        return false;
+    }
+    for (i = 0; i < SCOPE_REMOTE_BAR_PENDING_MAX; i++) {
+        if (!be->remote_bar_req[i].valid) {
+            pending = &be->remote_bar_req[i];
+            break;
+        }
+    }
+    if (!pending) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: remote NVMe shadow BAR pending table full "
+                      "backend=%u\n", be->id);
+        be->remote_failed_state = true;
+        be->remote_failed++;
+        return false;
+    }
+    request_id = ++be->remote_next_request_id;
+    if (!request_id) {
+        request_id = ++be->remote_next_request_id;
+    }
+    *pending = (ScopeRemoteBarRequest) {
+        .valid = true,
+        .write = write,
+        .request_id = request_id,
+        .offset = offset,
+        .size = size,
+        .value = value,
+        .wstrb = wstrb,
+        .submitted_us = g_get_monotonic_time(),
+    };
+    if (!write && (offset & ~0x3U) == NVME_REG_CSTS) {
+        be->remote_csts_read_pending = true;
+    }
+    if (!scope_remote_submit_bar(be->remote, write, &bar, request_id,
+                                 &local_err)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: remote NVMe shadow BAR %s failed backend=%u "
+                      "request=%" PRIu64 " off=0x%04x: %s\n",
+                      write ? "write submit" : "read submit", be->id,
+                      request_id, offset,
+                      local_err ? error_get_pretty(local_err) : "unknown");
+        error_free(local_err);
+        memset(pending, 0, sizeof(*pending));
+        if (!write && (offset & ~0x3U) == NVME_REG_CSTS) {
+            be->remote_csts_read_pending = false;
+        }
+        be->remote_failed_state = true;
+        be->remote_failed++;
+        return false;
+    }
+    if (write || (offset & ~0x3U) != NVME_REG_CSTS) {
+        SCOPE_PRINTF("[SCOPE REMOTE][NVME][BAR][SUBMIT] backend=%u "
+                     "request=%" PRIu64 " op=%s off=0x%04x size=%u "
+                     "wstrb=0x%x value=0x%016" PRIx64 "\n",
+                     be->id, request_id, write ? "write" : "read", offset,
+                     size, wstrb, value);
+        SCOPE_FFLUSH(stdout);
+    }
+    return true;
+}
+
+static bool scope_remote_nvme_shadow_handle_bar_response(
+    ScopeProxyState *s, const ScopeRemoteEvent *event)
+{
+    ScopeBackend *be = s->active;
+    ScopeRemoteBarRequest *pending =
+        scope_remote_nvme_shadow_find_bar_req(be, event->request_id);
+    uint16_t expected_opcode;
+    uint32_t aligned;
+
+    if (!pending) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: unmatched remote NVMe BAR response backend=%u "
+                      "request=%" PRIu64 "\n", be->id, event->request_id);
+        be->remote_failed_state = true;
+        be->remote_failed++;
+        return false;
+    }
+    expected_opcode = pending->write ? SCOPE_REMOTE_OP_BAR_WRITE_RSP :
+                                       SCOPE_REMOTE_OP_BAR_READ_RSP;
+    aligned = pending->offset & ~0x3U;
+    if (!pending->write && aligned == NVME_REG_CSTS) {
+        be->remote_csts_read_pending = false;
+    }
+    if (event->wire_opcode != expected_opcode ||
+        event->u.bar.offset != pending->offset ||
+        event->u.bar.size != pending->size ||
+        event->u.bar.wstrb != pending->wstrb) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: mismatched remote NVMe BAR response backend=%u "
+                      "request=%" PRIu64 " opcode=%u/%u off=0x%x/0x%x "
+                      "size=%u/%u wstrb=0x%x/0x%x\n",
+                      be->id, event->request_id, event->wire_opcode,
+                      expected_opcode, event->u.bar.offset, pending->offset,
+                      event->u.bar.size, pending->size, event->u.bar.wstrb,
+                      pending->wstrb);
+        if (aligned == NVME_REG_CC) {
+            be->guest_cc = be->remote_committed_cc;
+        }
+        memset(pending, 0, sizeof(*pending));
+        be->remote_failed_state = true;
+        be->remote_failed++;
+        return false;
+    }
+    if (event->status != SCOPE_REMOTE_STATUS_OK) {
+        SCOPE_PRINTF("[SCOPE REMOTE][NVME][BAR][ERR] backend=%u "
+                     "request=%" PRIu64 " off=0x%04x status=%d\n",
+                     be->id, event->request_id, event->u.bar.offset,
+                     event->status);
+        SCOPE_FFLUSH(stdout);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: remote NVMe shadow BAR response failed "
+                      "backend=%u request=%" PRIu64 " off=0x%04x status=%d\n",
+                      be->id, event->request_id, event->u.bar.offset,
+                      event->status);
+        if (aligned == NVME_REG_CC) {
+            be->guest_cc = be->remote_committed_cc;
+        }
+        memset(pending, 0, sizeof(*pending));
+        be->remote_failed_state = true;
+        be->remote_failed++;
+        return false;
+    }
+    if (aligned == NVME_REG_CC) {
+        uint32_t old_csts = be->remote_csts;
+
+        be->remote_committed_cc = scope_apply_wstrb32(
+            be->remote_committed_cc,
+            scope_extract_dword32(pending->value, pending->offset),
+            scope_extract_wstrb4(pending->wstrb, pending->offset));
+        be->remote_csts = (uint32_t)event->u.bar.value;
+        SCOPE_PRINTF("[SCOPE REMOTE][NVME][CC] backend=%u request=%" PRIu64
+                     " cc=0x%08x csts=0x%08x old_csts=0x%08x\n",
+                     be->id, event->request_id, be->remote_committed_cc,
+                     be->remote_csts, old_csts);
+        SCOPE_FFLUSH(stdout);
+    } else if (aligned == NVME_REG_CSTS) {
+        uint32_t old_csts = be->remote_csts;
+
+        be->remote_csts = (uint32_t)event->u.bar.value;
+        if (be->remote_csts != old_csts) {
+            SCOPE_PRINTF("[SCOPE REMOTE][NVME][CSTS] backend=%u "
+                         "request=%" PRIu64 " old=0x%08x new=0x%08x\n",
+                         be->id, event->request_id, old_csts,
+                         be->remote_csts);
+            SCOPE_FFLUSH(stdout);
+        }
+    } else {
+        SCOPE_PRINTF("[SCOPE REMOTE][NVME][BAR][DONE] backend=%u "
+                     "request=%" PRIu64 " off=0x%04x status=%d\n",
+                     be->id, event->request_id, event->u.bar.offset,
+                     event->status);
+        SCOPE_FFLUSH(stdout);
+    }
+    memset(pending, 0, sizeof(*pending));
+    scope_remote_nvme_shadow_rearm_queued_bar_timeouts(be);
+    return true;
+}
+
+static void scope_remote_nvme_shadow_refresh_csts(ScopeProxyState *s)
+{
+    ScopeBackend *be = s->active;
+
+    if (!be->remote_nvme_shadow_queue || be->remote_csts_read_pending ||
+        !be->remote || be->remote_failed_state) {
+        return;
+    }
+    (void)scope_remote_nvme_shadow_submit_bar(s, false, NVME_REG_CSTS,
+                                               0, 0, 4);
+}
+
 static bool scope_remote_prepare_payload(ScopeProxyState *s,
                                          ScopeBackend *be,
                                          ScopeRemoteRequest *req,
@@ -4717,6 +5094,151 @@ static bool scope_remote_finish_payload(ScopeProxyState *s,
     return offset == req->data_len;
 }
 
+static bool scope_remote_write_request_data(ScopeProxyState *s,
+                                            const ScopeRemoteRequest *req,
+                                            uint32_t data_offset,
+                                            const void *buf, uint32_t length)
+{
+    const uint8_t *src = buf;
+    uint32_t i;
+
+    if (data_offset > req->data_len || length > req->data_len - data_offset) {
+        return false;
+    }
+    for (i = 0; i < req->segment_count && length; i++) {
+        uint32_t segment_length = req->segments[i].length;
+        uint32_t chunk;
+
+        if (data_offset >= segment_length) {
+            data_offset -= segment_length;
+            continue;
+        }
+        chunk = MIN(length, segment_length - data_offset);
+        if (!scope_guest_mem_write(s,
+                                   req->segments[i].guest_pa + data_offset,
+                                   src, chunk)) {
+            return false;
+        }
+        src += chunk;
+        length -= chunk;
+        data_offset = 0;
+    }
+    return length == 0;
+}
+
+static bool scope_remote_sanitize_identify_ctrl(ScopeProxyState *s,
+                                                const ScopeRemoteRequest *req,
+                                                const ScopeRemoteEvent *event)
+{
+    uint32_t sgls = 0;
+
+    if (req->qid != SCOPE_ADMIN_QID || req->opcode != NVME_ADM_CMD_IDENTIFY ||
+        req->identify_cns != NVME_ID_CNS_CTRL ||
+        (event->u.nvme.status & ~1U)) {
+        return true;
+    }
+    if (!scope_remote_write_request_data(s, req,
+                                         offsetof(NvmeIdCtrl, sgls),
+                                         &sgls, sizeof(sgls))) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE: failed to mask unsupported remote NVMe SGL "
+                      "capability backend=%u request=%" PRIu64 "\n",
+                      s->active->id, req->request_id);
+        return false;
+    }
+    SCOPE_PRINTF("[SCOPE REMOTE][NVME][IDENTIFY] backend=%u request=%" PRIu64
+                 " masked_sgls=1\n", s->active->id, req->request_id);
+    SCOPE_FFLUSH(stdout);
+    return true;
+}
+
+static void scope_remote_clear_prp_retry(ScopeSqState *sq)
+{
+    sq->remote_prp_retry_active = false;
+    sq->remote_prp_retry_slot = 0;
+    sq->remote_prp_retry_count = 0;
+    sq->remote_prp_retry_since_us = 0;
+    sq->remote_prp_next_retry_us = 0;
+}
+
+static ScopeSqeReadStatus scope_remote_retry_prp(
+    ScopeProxyState *s, ScopeSqState *sq, uint16_t slot,
+    const NvmeCmd *cmd, uint64_t data_len,
+    const ScopeRemotePrpError *error)
+{
+    int64_t now_us = g_get_monotonic_time();
+    int64_t elapsed_us;
+
+    if (!sq->remote_prp_retry_active ||
+        sq->remote_prp_retry_slot != slot) {
+        scope_remote_clear_prp_retry(sq);
+        sq->remote_prp_retry_active = true;
+        sq->remote_prp_retry_slot = slot;
+        sq->remote_prp_retry_since_us = now_us;
+    }
+    sq->remote_prp_retry_count++;
+    elapsed_us = now_us - sq->remote_prp_retry_since_us;
+    if (elapsed_us < SCOPE_REMOTE_PRP_VISIBILITY_TIMEOUT_US) {
+        if (sq->remote_prp_retry_count == 1) {
+            SCOPE_PRINTF("[SCOPE REMOTE][PRP][WAIT] backend=%u qid=%u "
+                         "slot=%u cid=%u bytes=%" PRIu64
+                         " reason=%s entry=%u "
+                         "addr=0x%016" PRIx64 " prp1=0x%016" PRIx64
+                         " prp2=0x%016" PRIx64 " psdt=%u\n",
+                         s->active->id, sq->qid, slot,
+                         le16_to_cpu(cmd->cid), data_len,
+                         error && error->reason ? error->reason : "unknown",
+                         error ? error->entry : 0,
+                         error ? error->address : 0,
+                         le64_to_cpu(cmd->dptr.prp1),
+                         le64_to_cpu(cmd->dptr.prp2),
+                         NVME_CMD_FLAGS_PSDT(cmd->flags));
+            SCOPE_FFLUSH(stdout);
+        }
+        sq->remote_prp_next_retry_us =
+            now_us + SCOPE_REMOTE_PRP_VISIBILITY_RETRY_US;
+        return SCOPE_SQE_READ_WAIT;
+    }
+
+    SCOPE_PRINTF("[SCOPE REMOTE][PRP][ERR] backend=%u qid=%u slot=%u "
+                 "cid=%u bytes=%" PRIu64 " reason=%s entry=%u "
+                 "addr=0x%016" PRIx64
+                 " prp1=0x%016" PRIx64 " prp2=0x%016" PRIx64
+                 " psdt=%u retries=%u elapsed_us=%" PRId64 "\n",
+                 s->active->id, sq->qid, slot, le16_to_cpu(cmd->cid), data_len,
+                 error && error->reason ? error->reason : "unknown",
+                 error ? error->entry : 0, error ? error->address : 0,
+                 le64_to_cpu(cmd->dptr.prp1),
+                 le64_to_cpu(cmd->dptr.prp2),
+                 NVME_CMD_FLAGS_PSDT(cmd->flags), sq->remote_prp_retry_count,
+                 elapsed_us);
+    SCOPE_FFLUSH(stdout);
+    return SCOPE_SQE_READ_ERR;
+}
+
+static bool scope_remote_cq_has_room(const ScopeBackend *be, uint16_t cqid)
+{
+    const ScopeCqState *cq;
+    uint32_t used;
+    unsigned int i;
+
+    if (cqid >= SCOPE_MAX_NVME_QUEUES) {
+        return false;
+    }
+    cq = &be->cq[cqid];
+    if (!cq->valid || cq->depth < 2) {
+        return false;
+    }
+    used = (cq->shadow_tail + cq->depth - cq->last_guest_head) % cq->depth;
+    /* Reserve space for completions not yet returned by the remote agent. */
+    for (i = 0; i < SCOPE_REMOTE_MAX_INFLIGHT; i++) {
+        if (be->remote_req[i].valid && be->remote_req[i].cqid == cqid) {
+            used++;
+        }
+    }
+    return used < cq->depth - 1U;
+}
+
 static ScopeSqeReadStatus scope_process_remote_sq_entries(
     ScopeProxyState *s, ScopeSqState *sq, uint16_t new_tail,
     bool allow_stable_seed)
@@ -4732,15 +5254,25 @@ static ScopeSqeReadStatus scope_process_remote_sq_entries(
     while (cursor != new_tail) {
         struct scope_remote_nvme_submit submit = { 0 };
         ScopePendingAdminOp admin_op = { 0 };
+        ScopeRemotePrpError prp_error = { 0 };
         ScopeRemoteRequest *req;
         NvmeCmd cmd;
+        NvmeCmd cmd_confirm;
         uint64_t cmd_pa = sq->guest_base + (uint64_t)cursor * sizeof(cmd);
         uint64_t request_id;
         uint64_t data_len;
         uint16_t cid;
         Error *local_err = NULL;
 
+        if (sq->remote_prp_retry_active &&
+            sq->remote_prp_retry_slot == cursor &&
+            g_get_monotonic_time() < sq->remote_prp_next_retry_us) {
+            return SCOPE_SQE_READ_WAIT;
+        }
         if (be->remote_inflight >= be->remote_max_inflight) {
+            return SCOPE_SQE_READ_WAIT;
+        }
+        if (!scope_remote_cq_has_room(be, sq->linked_cqid)) {
             return SCOPE_SQE_READ_WAIT;
         }
         if (sq->qid == SCOPE_ADMIN_QID) {
@@ -4755,9 +5287,18 @@ static ScopeSqeReadStatus scope_process_remote_sq_entries(
             }
             data_len = scope_remote_admin_data_len(&cmd);
         } else {
-            if (!scope_guest_mem_read(s, cmd_pa, &cmd, sizeof(cmd))) {
+            if (!scope_guest_mem_read(s, cmd_pa, &cmd, sizeof(cmd)) ||
+                !scope_guest_mem_read(s, cmd_pa, &cmd_confirm,
+                                      sizeof(cmd_confirm))) {
                 return SCOPE_SQE_READ_ERR;
             }
+            if (memcmp(&cmd, &cmd_confirm, sizeof(cmd)) != 0) {
+                prp_error.reason = "io-sqe-unstable";
+                prp_error.address = cmd_pa;
+                return scope_remote_retry_prp(s, sq, cursor, &cmd_confirm, 0,
+                                              &prp_error);
+            }
+            cmd = cmd_confirm;
             data_len = scope_io_cmd_data_len(s, &cmd);
         }
         if (data_len > UINT32_MAX ||
@@ -4770,12 +5311,23 @@ static ScopeSqeReadStatus scope_process_remote_sq_entries(
         submit.direction = scope_remote_direction(&cmd, sq->qid);
         submit.data_len = data_len;
         if (data_len &&
-            !scope_remote_collect_prps(s, &cmd, data_len, &submit)) {
-            SCOPE_PRINTF("[SCOPE REMOTE][PRP][ERR] backend=%u qid=%u cid=%u "
-                         "bytes=%" PRIu64 "\n",
-                         be->id, sq->qid, le16_to_cpu(cmd.cid), data_len);
-            return SCOPE_SQE_READ_ERR;
+            !scope_remote_collect_prps(s, &cmd, data_len, &submit,
+                                       &prp_error)) {
+            return scope_remote_retry_prp(s, sq, cursor, &cmd, data_len,
+                                          &prp_error);
         }
+        if (sq->remote_prp_retry_active) {
+            SCOPE_PRINTF("[SCOPE REMOTE][PRP][READY] backend=%u qid=%u "
+                         "slot=%u cid=%u bytes=%" PRIu64
+                         " segments=%u retries=%u elapsed_us=%" PRId64 "\n",
+                         be->id, sq->qid, cursor, le16_to_cpu(cmd.cid),
+                         data_len, submit.segment_count,
+                         sq->remote_prp_retry_count,
+                         g_get_monotonic_time() -
+                         sq->remote_prp_retry_since_us);
+            SCOPE_FFLUSH(stdout);
+        }
+        scope_remote_clear_prp_retry(sq);
 
         request_id = ++be->remote_next_request_id;
         if (!request_id) {
@@ -4789,6 +5341,11 @@ static ScopeSqeReadStatus scope_process_remote_sq_entries(
         cid = le16_to_cpu(cmd.cid);
         req->qid = sq->qid;
         req->cid = cid;
+        req->opcode = cmd.opcode;
+        if (sq->qid == SCOPE_ADMIN_QID &&
+            cmd.opcode == NVME_ADM_CMD_IDENTIFY) {
+            req->identify_cns = ((const NvmeIdentify *)&cmd)->cns;
+        }
         req->sq_head = (cursor + 1U) % sq->depth;
         req->cqid = sq->linked_cqid;
         req->data_len = data_len;
@@ -4810,6 +5367,18 @@ static ScopeSqeReadStatus scope_process_remote_sq_entries(
             scope_remote_release_request(be, req);
             be->remote_failed_state = true;
             return SCOPE_SQE_READ_ERR;
+        }
+        if (be->remote_nvme_shadow_queue) {
+            uint32_t db_off = SCOPE_NVME_DOORBELL_BASE +
+                (uint32_t)(2U * sq->qid) * be->doorbell_stride;
+            uint16_t staged_tail = (cursor + 1U) % sq->depth;
+            uint64_t db_data = scope_pack_dword32_for_offset(staged_tail, db_off);
+            uint8_t db_wstrb = scope_pack_wstrb4_for_offset(db_off);
+
+            if (!scope_remote_nvme_shadow_submit_bar(s, true, db_off,
+                                                      db_data, db_wstrb, 4)) {
+                return SCOPE_SQE_READ_ERR;
+            }
         }
         if (sq->qid == SCOPE_ADMIN_QID) {
             if (admin_op.valid) {
@@ -4839,8 +5408,28 @@ static ScopeSqeReadStatus scope_process_new_sq_entries(ScopeProxyState *s,
     uint16_t cursor;
 
     if (scope_backend_is_remote(s->active)) {
-        return scope_process_remote_sq_entries(s, sq, new_tail,
-                                               allow_stable_seed);
+        ScopeSqeReadStatus status;
+
+        if (s->active->remote_nvme_shadow_queue) {
+            if (!sq->valid || !sq->depth || new_tail >= sq->depth) {
+                return SCOPE_SQE_READ_ERR;
+            }
+            sq->remote_target_tail = new_tail;
+            sq->remote_target_valid = true;
+        }
+        status = scope_process_remote_sq_entries(s, sq, new_tail,
+                                                 allow_stable_seed);
+        if (s->active->remote_nvme_shadow_queue) {
+            if (status == SCOPE_SQE_READ_ERR) {
+                return status;
+            }
+            if (sq->last_guest_tail == sq->remote_target_tail) {
+                sq->remote_target_valid = false;
+            }
+            /* Flow control is internal to the shadow transport. */
+            return SCOPE_SQE_READ_OK;
+        }
+        return status;
     }
 
     if (!sq->valid || !sq->depth || new_tail >= sq->depth) {
@@ -4975,6 +5564,39 @@ static ScopeSqeReadStatus scope_process_new_sq_entries(ScopeProxyState *s,
 
     sq->last_guest_tail = new_tail;
     return SCOPE_SQE_READ_OK;
+}
+
+static bool scope_remote_nvme_shadow_resume_targets(ScopeProxyState *s)
+{
+    ScopeBackend *be = s->active;
+    bool progressed = false;
+    uint32_t qid;
+
+    if (!be->remote_nvme_shadow_queue || be->remote_failed_state) {
+        return false;
+    }
+    for (qid = 0; qid < SCOPE_MAX_NVME_QUEUES; qid++) {
+        ScopeSqState *sq = &be->sq[qid];
+        ScopeSqeReadStatus status;
+        uint16_t before;
+
+        if (!sq->remote_target_valid) {
+            continue;
+        }
+        before = sq->last_guest_tail;
+        status = scope_process_remote_sq_entries(s, sq, sq->remote_target_tail,
+                                                 false);
+        if (status == SCOPE_SQE_READ_ERR) {
+            be->remote_failed_state = true;
+            be->remote_failed++;
+            return true;
+        }
+        progressed |= before != sq->last_guest_tail;
+        if (sq->last_guest_tail == sq->remote_target_tail) {
+            sq->remote_target_valid = false;
+        }
+    }
+    return progressed;
 }
 
 static bool scope_is_doorbell_offset(ScopeProxyState *s, uint32_t aligned_offset,
@@ -5215,6 +5837,10 @@ static bool scope_remote_publish_completion(ScopeProxyState *s,
         be->remote_failed_state = true;
         return false;
     }
+    if (!scope_remote_sanitize_identify_ctrl(s, req, event)) {
+        be->remote_failed_state = true;
+        return false;
+    }
 
     wire_status = event->u.nvme.status & ~1U;
     cqe.result = cpu_to_le32(event->u.nvme.result);
@@ -5269,6 +5895,9 @@ static bool scope_remote_backend_poll(ScopeProxyState *s)
     }
     now_us = g_get_monotonic_time();
     timeout_ms = scope_remote_request_timeout_ms(be->remote);
+    if (scope_remote_nvme_shadow_check_bar_timeouts(s, now_us, timeout_ms)) {
+        return true;
+    }
     for (i = 0; timeout_ms && i < SCOPE_REMOTE_MAX_INFLIGHT; i++) {
         ScopeRemoteRequest *req = &be->remote_req[i];
 
@@ -5330,10 +5959,20 @@ static bool scope_remote_backend_poll(ScopeProxyState *s)
             be->remote_failed++;
             break;
         }
+        if (event.type == SCOPE_REMOTE_EVENT_BAR_RESPONSE &&
+            be->remote_nvme_shadow_queue) {
+            if (!scope_remote_nvme_shadow_handle_bar_response(s, &event)) {
+                break;
+            }
+            continue;
+        }
         if (event.type == SCOPE_REMOTE_EVENT_NVME_COMPLETE &&
             !scope_remote_publish_completion(s, &event)) {
             break;
         }
+    }
+    if (!be->remote_failed_state) {
+        progressed = scope_remote_nvme_shadow_resume_targets(s) || progressed;
     }
     return progressed;
 }
@@ -5847,9 +6486,12 @@ static bool scope_handle_nvme_bar_read(ScopeProxyState *s, uint32_t offset, uint
         if (scope_backend_is_remote(s->active)) {
             uint32_t csts = 0;
 
-            if (NVME_CC_EN(s->active->guest_cc) &&
-                !s->active->remote_failed_state) {
-                csts |= 1U; /* RDY */
+            if (s->active->remote_nvme_shadow_queue) {
+                scope_remote_nvme_shadow_refresh_csts(s);
+                csts = s->active->remote_csts;
+            } else if (NVME_CC_EN(s->active->guest_cc) &&
+                       !s->active->remote_failed_state) {
+                csts |= 1U; /* semantic remote endpoint is ready */
             }
             if (s->active->remote_failed_state) {
                 csts |= 2U; /* CFS */
@@ -6410,6 +7052,7 @@ static bool scope_nvme_backend_realize(ScopeProxyState *s, Error **errp)
             .guest_ddr_base = s->guest_ddr_base,
             .guest_ddr_size = s->guest_ddr_size,
             .coherent_alias_base = s->bypass_coherent_alias_base,
+            .nvme_shadow_queue = be->remote_nvme_shadow_queue,
         };
         struct scope_remote_device_info info = { 0 };
 
@@ -6445,6 +7088,10 @@ static bool scope_nvme_backend_realize(ScopeProxyState *s, Error **errp)
             be->remote_max_inflight = 1;
         }
         be->remote_next_request_id = 0;
+        be->remote_csts = 0;
+        be->remote_committed_cc = 0;
+        be->remote_csts_read_pending = false;
+        memset(be->remote_bar_req, 0, sizeof(be->remote_bar_req));
         g_hash_table_insert(be->ns_lba_shift_map,
                             GUINT_TO_POINTER(be->remote_namespace_id),
                             GUINT_TO_POINTER(info.lba_shift));

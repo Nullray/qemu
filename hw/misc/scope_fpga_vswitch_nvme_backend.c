@@ -38,6 +38,21 @@ static void scope_nvme_backend_process_bar_packet(
 
         ok = scope_handle_nvme_bar_write(s, pkt->bar_offset, lane_data,
                                          wstrb, size_bytes);
+        if (ok && s->active->remote_nvme_shadow_queue) {
+            bool is_sq = false;
+            uint16_t doorbell_qid = 0;
+            uint32_t aligned = pkt->bar_offset & ~0x3U;
+
+            /* SQ doorbells are emitted once per staged command by the
+             * remote queue drain. Guest CQ heads stay virtual. */
+            if (!scope_is_doorbell_offset(s, aligned, &is_sq,
+                                          &doorbell_qid)) {
+                ok = scope_remote_nvme_shadow_submit_bar(s, true,
+                                                         pkt->bar_offset,
+                                                         lane_data, wstrb,
+                                                         size_bytes);
+            }
+        }
         resp = ok ? 0x0U : 0x2U;
         scope_log_bar_write(s, pkt->seq, pkt->bar_offset, pkt->flags,
                             size_bytes, wstrb, lane_data, ok);

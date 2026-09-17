@@ -29,6 +29,7 @@ typedef struct ScopeRemoteConfig {
     uint64_t coherent_alias_base;
     uint32_t device_type;
     bool ixgbe_shadow_ring;
+    bool nvme_shadow_queue;
 } ScopeRemoteConfig;
 
 typedef enum ScopeRemoteEventType {
@@ -43,6 +44,7 @@ typedef enum ScopeRemoteEventType {
 
 typedef struct ScopeRemoteEvent {
     ScopeRemoteEventType type;
+    uint16_t wire_opcode;
     uint64_t request_id;
     int32_t status;
     union {

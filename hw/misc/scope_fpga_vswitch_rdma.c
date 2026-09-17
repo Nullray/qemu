@@ -32,6 +32,7 @@
 typedef struct ScopeRemoteTxItem {
     struct scope_remote_message msg;
     size_t length;
+    bool bar_request;
 } ScopeRemoteTxItem;
 
 struct ScopeRemoteState {
@@ -49,6 +50,8 @@ struct ScopeRemoteState {
     int dmabuf_fd;
     bool recv_posted;
     bool tx_inflight;
+    bool bar_request_inflight;
+    uint64_t bar_request_id;
     GQueue tx_pending;
     bool failed;
     uint64_t session_id;
@@ -346,6 +349,16 @@ static bool scope_remote_handshake(ScopeRemoteState *r,
             }
             required_features = SCOPE_REMOTE_IXGBE_FEATURES;
         }
+    } else if (config->nvme_shadow_queue) {
+        if (r->memory_mode == SCOPE_REMOTE_MEMORY_INLINE) {
+            error_setg(errp, "remote NVMe shadow-queue transport does not "
+                       "support inline memory mode");
+            return false;
+        }
+        required_features =
+            r->memory_mode == SCOPE_REMOTE_MEMORY_HOST_STAGING ?
+            SCOPE_REMOTE_NVME_SHADOW_STAGING_FEATURES :
+            SCOPE_REMOTE_NVME_SHADOW_DIRECT_FEATURES;
     } else {
         required_features =
             r->memory_mode == SCOPE_REMOTE_MEMORY_HOST_STAGING ?
@@ -596,6 +609,44 @@ uint32_t scope_remote_request_timeout_ms(const ScopeRemoteState *r)
     return r ? r->request_timeout_ms : 0;
 }
 
+static bool scope_remote_start_next_tx(ScopeRemoteState *r, Error **errp)
+{
+    ScopeRemoteTxItem *item;
+    uint64_t request_id;
+
+    if (r->tx_inflight || g_queue_is_empty(&r->tx_pending)) {
+        return true;
+    }
+    /*
+     * The agents use one receive WQE and synchronously send each BAR reply.
+     * Keep the control stream ordered until that reply has been consumed and
+     * a fresh receive WQE is posted.  This is especially important for iWARP,
+     * where several back-to-back BAR SENDs can otherwise stall both peers.
+     */
+    if (r->bar_request_inflight) {
+        return true;
+    }
+    item = g_queue_pop_head(&r->tx_pending);
+    request_id = le64_to_cpu(item->msg.hdr.request_id);
+    memcpy(r->tx, &item->msg, item->length);
+    if (!scope_remote_send(r, item->length, errp)) {
+        g_free(item);
+        return false;
+    }
+    if (item->bar_request) {
+        r->bar_request_inflight = true;
+        r->bar_request_id = request_id;
+        fprintf(stderr,
+                "[SCOPE RDMA][BAR][POST] request=%" PRIu64
+                " opcode=%u queued=%u\n",
+                request_id, le16_to_cpu(item->msg.hdr.opcode),
+                g_queue_get_length(&r->tx_pending));
+        fflush(stderr);
+    }
+    g_free(item);
+    return true;
+}
+
 static bool scope_remote_submit_message(ScopeRemoteState *r, uint16_t opcode,
                                         const void *payload, size_t payload_len,
                                         uint64_t request_id, Error **errp)
@@ -615,17 +666,13 @@ static bool scope_remote_submit_message(ScopeRemoteState *r, uint16_t opcode,
     scope_remote_init_hdr(r, &item->msg, opcode, payload_len, request_id);
     memcpy(item->msg.payload, payload, payload_len);
     item->length = sizeof(item->msg.hdr) + payload_len;
+    item->bar_request = opcode == SCOPE_REMOTE_OP_BAR_READ ||
+                        opcode == SCOPE_REMOTE_OP_BAR_WRITE;
     g_queue_push_tail(&r->tx_pending, item);
 
-    if (!r->tx_inflight) {
-        item = g_queue_pop_head(&r->tx_pending);
-        memcpy(r->tx, &item->msg, item->length);
-        if (!scope_remote_send(r, item->length, errp)) {
-            g_free(item);
-            r->failed = true;
-            return false;
-        }
-        g_free(item);
+    if (!scope_remote_start_next_tx(r, errp)) {
+        r->failed = true;
+        return false;
     }
     return true;
 }
@@ -689,6 +736,7 @@ bool scope_remote_poll(ScopeRemoteState *r, ScopeRemoteEvent *event,
     struct ibv_wc wc;
     uint32_t payload_len;
     uint16_t opcode;
+    bool bar_response = false;
     int ret;
 
     memset(event, 0, sizeof(*event));
@@ -704,19 +752,18 @@ bool scope_remote_poll(ScopeRemoteState *r, ScopeRemoteEvent *event,
             return true;
         }
         if (ret == 1) {
+            if (r->bar_request_inflight) {
+                fprintf(stderr,
+                        "[SCOPE RDMA][BAR][SEND_CQ] request=%" PRIu64
+                        " status=%s\n",
+                        r->bar_request_id, ibv_wc_status_str(wc.status));
+                fflush(stderr);
+            }
             r->tx_inflight = false;
-            if (!g_queue_is_empty(&r->tx_pending)) {
-                ScopeRemoteTxItem *item =
-                    g_queue_pop_head(&r->tx_pending);
-
-                memcpy(r->tx, &item->msg, item->length);
-                if (!scope_remote_send(r, item->length, errp)) {
-                    g_free(item);
-                    r->failed = true;
-                    event->type = SCOPE_REMOTE_EVENT_FAILED;
-                    return true;
-                }
-                g_free(item);
+            if (!scope_remote_start_next_tx(r, errp)) {
+                r->failed = true;
+                event->type = SCOPE_REMOTE_EVENT_FAILED;
+                return true;
             }
         }
     }
@@ -742,11 +789,24 @@ bool scope_remote_poll(ScopeRemoteState *r, ScopeRemoteEvent *event,
     event->request_id = le64_to_cpu(r->rx->hdr.request_id);
     event->status = (int32_t)le32_to_cpu(r->rx->hdr.status);
     opcode = le16_to_cpu(r->rx->hdr.opcode);
+    event->wire_opcode = opcode;
     payload_len = le32_to_cpu(r->rx->hdr.payload_len);
     if (opcode == SCOPE_REMOTE_OP_BAR_READ_RSP ||
         opcode == SCOPE_REMOTE_OP_BAR_WRITE_RSP) {
         const struct scope_remote_bar *bar = (const void *)r->rx->payload;
 
+        bar_response = true;
+        if (!r->bar_request_inflight ||
+            event->request_id != r->bar_request_id) {
+            error_setg(errp,
+                       "remote-rdma BAR response request id mismatch");
+            goto invalid_message;
+        }
+        fprintf(stderr,
+                "[SCOPE RDMA][BAR][RECV_CQ] request=%" PRIu64
+                " opcode=%u status=%d\n",
+                event->request_id, opcode, event->status);
+        fflush(stderr);
         if (payload_len != sizeof(*bar)) {
             error_setg(errp, "remote-rdma BAR response has invalid length");
             goto invalid_message;
@@ -818,6 +878,15 @@ bool scope_remote_poll(ScopeRemoteState *r, ScopeRemoteEvent *event,
     if (!scope_remote_post_recv(r, errp)) {
         r->failed = true;
         event->type = SCOPE_REMOTE_EVENT_FAILED;
+        return true;
+    }
+    if (bar_response) {
+        r->bar_request_inflight = false;
+        r->bar_request_id = 0;
+        if (!scope_remote_start_next_tx(r, errp)) {
+            r->failed = true;
+            event->type = SCOPE_REMOTE_EVENT_FAILED;
+        }
     }
     return true;
 
