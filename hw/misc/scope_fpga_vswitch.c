@@ -331,6 +331,7 @@ typedef enum ScopeBackendType {
     SCOPE_BACKEND_IGB,
     SCOPE_BACKEND_IXGBE,
     SCOPE_BACKEND_VORTEX,
+    SCOPE_BACKEND_XHCI,
 } ScopeBackendType;
 
 typedef enum ScopeBackendTransport {
@@ -369,6 +370,7 @@ typedef struct ScopeIgbState ScopeIgbState;
 typedef struct ScopeIxgbeState ScopeIxgbeState;
 typedef struct ScopeVortexState ScopeVortexState;
 typedef struct ScopeGidsService ScopeGidsService;
+typedef struct ScopeXhciState ScopeXhciState;
 typedef struct ScopeBackendOps ScopeBackendOps;
 
 static bool scope_gids_service_realize(ScopeProxyState *s,
@@ -452,6 +454,7 @@ typedef struct ScopeBackend {
     ScopeIxgbeState *ixgbe;
     ScopeVortexState *vortex;
     ScopeGidsService *gids;
+    ScopeXhciState *xhci;
 } ScopeBackend;
 
 struct ScopeBackendOps {
@@ -469,6 +472,10 @@ static const ScopeBackendOps scope_nvme_backend_ops;
 static const ScopeBackendOps scope_igb_backend_ops;
 static const ScopeBackendOps scope_ixgbe_backend_ops;
 static const ScopeBackendOps scope_vortex_backend_ops;
+static const ScopeBackendOps scope_xhci_backend_ops;
+static void scope_vcfg_init_xhci_endpoint(ScopeProxyState *s,
+                                         ScopeVswitchConfigFn *fn,
+                                         ScopeBackend *be);
 static bool scope_nvme_backend_realize(ScopeProxyState *s, Error **errp);
 static void scope_nvme_backend_cleanup(ScopeProxyState *s, ScopeBackend *be);
 static bool scope_recover_missing_bar_done(ScopeProxyState *s, int64_t now_us);
@@ -508,6 +515,7 @@ struct ScopeProxyState {
     uint64_t bypass_coherent_alias_base;
     bool guest_mem_raw_fallback;
     bool vortex_log;
+    bool allow_unsafe_xhci_p2p;
     int fpga_bypass_bar_index;
     uint32_t proxy_ctrl_shadow;
     ScopeVswitchConfigFn vcfg[SCOPE_VSWITCH_ECAM_FUNC_COUNT];
@@ -757,6 +765,8 @@ static bool scope_parse_backend_object(ScopeJsonCursor *j, ScopeBackend *be,
                     be->type = SCOPE_BACKEND_IXGBE;
                 } else if (!strcmp(value, "vortex")) {
                     be->type = SCOPE_BACKEND_VORTEX;
+                } else if (!strcmp(value, "xhci")) {
+                    be->type = SCOPE_BACKEND_XHCI;
                 } else {
                     error_setg(errp, "backend config: unsupported device type '%s'",
                                value);
@@ -2204,6 +2214,8 @@ static void scope_vcfg_init_all(ScopeProxyState *s, PCIDevice *pci_dev)
             scope_vcfg_init_ixgbe_endpoint(ep, SCOPE_VSWITCH_EP_BDF(i));
         } else if (be->type == SCOPE_BACKEND_VORTEX) {
             scope_vcfg_init_vortex_endpoint(ep, SCOPE_VSWITCH_EP_BDF(i));
+        } else if (be->type == SCOPE_BACKEND_XHCI) {
+            scope_vcfg_init_xhci_endpoint(s, ep, be);
         } else {
             memset(ep, 0, sizeof(*ep));
             ep->bdf = SCOPE_VSWITCH_EP_BDF(i);
@@ -3164,6 +3176,7 @@ static bool scope_guest_mem_write(ScopeProxyState *s, uint64_t guest_pa,
 
 #include "scope_fpga_vswitch_igb_backend.c"
 #include "scope_fpga_vswitch_ixgbe_backend.c"
+#include "scope_fpga_vswitch_xhci_backend.c"
 
 static void scope_capture_admin_seed(ScopeProxyState *s)
 {
@@ -5989,7 +6002,8 @@ static void scope_update_virtual_intx(ScopeProxyState *s)
         bool backend_pending = false;
         s->active = &s->backends[b];
         if (s->active->type == SCOPE_BACKEND_IGB ||
-            s->active->type == SCOPE_BACKEND_IXGBE) {
+            s->active->type == SCOPE_BACKEND_IXGBE ||
+            s->active->type == SCOPE_BACKEND_XHCI) {
             pending |= s->active->intx_pending;
             continue;
         }
@@ -6709,6 +6723,9 @@ static void scope_process_cfg_packet(ScopeProxyState *s, const struct scope_dma3
                 scope_cfg_write_touches_bar_route(actual_addr, len);
 
             scope_vcfg_write_masked(fn, actual_addr, val, len);
+            if (be->xhci) {
+                scope_xhci_config_changed(s, be, fn);
+            }
 
             sync_ok = scope_sync_ecam_shadow_range(s, shadow_index,
                                                    actual_addr, len,
@@ -7242,6 +7259,8 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
             be->ops = &scope_ixgbe_backend_ops;
         } else if (be->type == SCOPE_BACKEND_VORTEX) {
             be->ops = &scope_vortex_backend_ops;
+        } else if (be->type == SCOPE_BACKEND_XHCI) {
+            be->ops = &scope_xhci_backend_ops;
         } else {
             be->ops = &scope_nvme_backend_ops;
         }
@@ -7272,7 +7291,9 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
         }
         if (s->active->ops->requires_real_pci &&
             !scope_backend_is_remote(s->active)) {
-            if (!scope_enable_real_pci_bus_master(s, errp) ||
+            if (!(s->active->type == SCOPE_BACKEND_XHCI ?
+                  scope_xhci_prepare_pci(s, errp) :
+                  scope_enable_real_pci_bus_master(s, errp)) ||
                 !scope_parse_real_bar0(s, errp)) {
                 goto fail;
             }
@@ -7501,6 +7522,8 @@ static const Property scope_proxy_properties[] = {
                      guest_mem_raw_fallback, false),
     DEFINE_PROP_BOOL("vortex-log", ScopeProxyState,
                      vortex_log, false),
+    DEFINE_PROP_BOOL("allow-unsafe-xhci-p2p", ScopeProxyState,
+                     allow_unsafe_xhci_p2p, false),
     DEFINE_PROP_BOOL("intx-retry-pulse", ScopeProxyState,
                      intx_retry_pulse, false),
 };
