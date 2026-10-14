@@ -7,6 +7,7 @@ import json
 import mmap
 import os
 from pathlib import Path
+import signal
 import struct
 import subprocess
 import sys
@@ -108,8 +109,9 @@ def run_case(mode):
              "-device", "pcie-root-port,id=rp", "-device", device],
             env=env, stdout=logfile, stderr=subprocess.STDOUT)
         mappings = []
+        files = []
         try:
-            if mode not in ("normal", "legacy"):
+            if mode not in ("normal", "legacy", "single-slot", "packet-ring"):
                 proc.wait(timeout=6)
                 assert proc.returncode != 0, mode
                 logfile.seek(0)
@@ -148,7 +150,7 @@ def run_case(mode):
             assert user[ECAM + 0x60] == 0x31
             seq = 1
 
-            def packet(kind, offset, value=0, size=4, cookie=None):
+            def packet(kind, offset, value=0, size=4, cookie=None, wait=True):
                 nonlocal seq
                 number = cookie if cookie is not None else seq
                 seq += 1
@@ -163,9 +165,16 @@ def run_case(mode):
                 old = get32(user, MBX + 0x3c)
                 wire = struct.pack("<8I", 0x5844504b, kind, flags, 32, number,
                                    offset, lane_value & 0xffffffff, lane_value >> 32)
-                slot = ((seq - 1) % 128) * 32
+                # The old cyclic XDMA setup has one descriptor, so each TLAST
+                # reuses slot zero. The fixed setup gives every packet a
+                # separate 64-byte descriptor (C2H minimum buffer length).
+                slot = (0 if mode == "single-slot" else
+                        ((seq - 1) % 1024) * 64 if mode == "packet-ring" else
+                        ((seq - 1) % 128) * 32)
                 ring[slot + 8:slot + 32] = wire[8:]
                 ring[slot:slot + 8] = wire[:8]
+                if not wait:
+                    return number
                 if kind == 1:
                     wait_until(lambda: get32(user, MBX + 0x10) == number,
                                proc, "CFG acknowledgement")
@@ -209,13 +218,58 @@ def run_case(mode):
             assert response & 8 and get32(bar, 0x2004) == 0
             packet(4, 0x2004, cookie=number)
             wait_until(lambda: get32(bar, 0x2004) == 0x101, proc, "doorbell DONE")
+            # Pending port events must not interrupt an unstarted controller,
+            # including the transient RUN=0/HCHalted=0 state during stopping.
+            packet(2, 0x40, 4)
+            put32(bar, 0x44, 8)
+            put32(bar, 0x1020, 3)
+
+            def assert_no_intx(description):
+                deadline = time.monotonic() + 0.03
+                while time.monotonic() < deadline:
+                    assert get32(user, MBX + 0x50) == 0, description
+                    assert proc.poll() is None
+                    time.sleep(0.001)
+
+            assert_no_intx("RUN=0 with pending port event")
             put32(bar, 0x44, 9)
+            packet(2, 0x40, 5)
+            assert_no_intx("RUN=1 while physical HCHalted is still set")
+            # Preserve genuine error reporting when hardware halts itself.
+            packet(2, 0x40, 4)
+            for error in (1 << 2, 1 << 12):
+                put32(bar, 0x44, 9 | error)
+                wait_until(lambda: get32(user, MBX + 0x50) == 1,
+                           proc, "halted controller error interrupt")
+                put32(bar, 0x44, 9)
+                wait_until(lambda: get32(user, MBX + 0x50) == 0,
+                           proc, "error interrupt cleared")
+            # An inaccessible BAR reads as all ones, not a valid error IRQ.
+            for register in (0x40, 0x44, 0x1020):
+                put32(bar, 0x1020, 2)
+                wait_until(lambda: get32(user, MBX + 0x50) == 0,
+                           proc, "interrupter temporarily masked")
+                put32(bar, 0x44, 8)
+                packet(2, 0x40, 5)
+                put32(bar, register, 0xffffffff)
+                if register != 0x1020:
+                    put32(bar, 0x1020, 3)
+                assert_no_intx(f"inaccessible register {register:#x}")
+            put32(bar, 0x1020, 2)
+            put32(bar, 0x44, 8)
+            packet(2, 0x40, 5)
             put32(bar, 0x1020, 3)
             wait_until(lambda: get32(user, MBX + 0x50) == 1, proc, "INTx assertion")
             packet(1, 4, 0x406)
             wait_until(lambda: get32(user, MBX + 0x50) == 0, proc, "INTx mask")
             packet(1, 4, 6)
             wait_until(lambda: get32(user, MBX + 0x50) == 1, proc, "INTx unmask")
+            packet(2, 0x40, 4)
+            wait_until(lambda: get32(user, MBX + 0x50) == 0,
+                       proc, "stopping controller deasserts INTx")
+            packet(2, 0x40, 5)
+            wait_until(lambda: get32(user, MBX + 0x50) == 1,
+                       proc, "restarting controller preserves pending event")
             # File-backed registers have no hardware W1C; simulate xHC clearing IP.
             put32(bar, 0x1020, 2)
             wait_until(lambda: get32(user, MBX + 0x50) == 0, proc, "INTx clear")
@@ -226,14 +280,42 @@ def run_case(mode):
             assert not get32(pci, 4) & 4 and not get32(bar, 0x40) & 1
             packet(1, 0xbc, 0x444d4150)
             assert get32(pci, 4) & 4
-            _, response, _ = packet(2, 0x2008, 0x102)  # no DONE
+            number, response, _ = packet(2, 0x2008, 0x102)
             assert response & 8
+            if mode in ("single-slot", "packet-ring"):
+                # Pause only this file-backed QEMU, then publish the hardware
+                # order DONE -> readback before its polling thread resumes.
+                # This makes loss in the single-descriptor layout deterministic.
+                proc.send_signal(signal.SIGSTOP)
+                _, stopped = os.waitpid(proc.pid, os.WUNTRACED)
+                assert os.WIFSTOPPED(stopped)
+                try:
+                    packet(4, 0x2008, cookie=number)
+                    read_number = packet(3, 0x2008, wait=False)
+                finally:
+                    proc.send_signal(signal.SIGCONT)
+                wait_until(lambda: get32(user, MBX + 0x38) == read_number,
+                           proc, "back-to-back doorbell readback")
+                if mode == "packet-ring":
+                    wait_until(lambda: get32(bar, 0x2008) == 0x102,
+                               proc, "retained DONE commits physical doorbell")
+                    assert get32(pci, 4) & 4
+                    return
+            # Missing or overwritten DONE must stop DMA without ringing xHC.
             wait_until(lambda: not get32(pci, 4) & 4, proc, "timeout DMA disable")
             assert get32(bar, 0x2008) == 0
+            logfile.seek(0)
+            failure_log = logfile.read()
+            assert "timed out waiting for BAR_WRITE_DONE" in failure_log
+            assert "off=0x2008" in failure_log and "disabling physical DMA" in failure_log
             packet(1, 4, 6)
             assert not get32(pci, 4) & 4  # failure cannot be re-enabled by config
-            for handle in files:
-                handle.close()
+            _, response, hcs = packet(3, 4)
+            assert response & 3 == 2 and hcs & 0xffffffff == 0xffffffff
+            assert hcs & 0xff == 255  # guest's misleading MaxSlots diagnostic
+            _, response, crcr = packet(3, 0x58, size=8)
+            assert response & 3 == 2 and crcr == 0xffffffffffffffff
+            assert get32(bar, 4) & 0xff == 32  # physical xHC is still accessible
         except Exception:
             logfile.flush()
             logfile.seek(0)
@@ -245,10 +327,12 @@ def run_case(mode):
                 proc.wait(timeout=6)
             for mapping in mappings:
                 mapping.close()
+            for handle in files:
+                handle.close()
             logfile.close()
 
 
-for case in ("normal", "legacy", "bound", "iommu", "wrong-class", "msi",
+for case in ("normal", "legacy", "single-slot", "packet-ring", "bound", "iommu", "wrong-class", "msi",
              "dma32", "no-opt-in", "bad-runtime", "not-ready", "bios-owned"):
     run_case(case)
     print(f"PASS: {case}")

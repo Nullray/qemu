@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Physical xHCI ownership. Included by scope_fpga_vswitch.c. */
+#include "qemu/error-report.h"
 
 #define SCOPE_XHCI_DMA_CAP       0xb0U
 #define SCOPE_XHCI_DMA_CAP_LEN   40U
@@ -11,6 +12,8 @@
 #define SCOPE_XHCI_INTE          (1U << 2)
 #define SCOPE_XHCI_HCH           (1U << 0)
 #define SCOPE_XHCI_EINT          (1U << 3)
+#define SCOPE_XHCI_HSE           (1U << 2)
+#define SCOPE_XHCI_HCE           (1U << 12)
 #define SCOPE_XHCI_CNR           (1U << 11)
 
 struct ScopeXhciState {
@@ -141,9 +144,24 @@ static bool scope_xhci_prepare_pci(ScopeProxyState *s, Error **errp)
     return true;
 }
 
-static void scope_xhci_fail(ScopeProxyState *s)
+static void scope_xhci_fail(ScopeProxyState *s, const char *reason)
 {
     ScopeBackend *be = s->active;
+    ScopeXhciState *x = be->xhci;
+
+    /* Failures must be visible even without -d guest_errors. Preserve the
+     * pending request's identity before clearing it for shutdown.
+     */
+    if (!x->failed) {
+        error_report("SCOPE xhci: backend=%u host=%s %s; "
+                     "pending=%d seq=%u off=0x%x elapsed_us=%" PRId64
+                     "; disabling physical DMA",
+                     be->id, be->real_host_bdf, reason,
+                     x->doorbell_pending, x->pending_doorbell.seq,
+                     x->pending_doorbell.bar_offset,
+                     x->doorbell_pending ?
+                         g_get_monotonic_time() - x->doorbell_since_us : 0);
+    }
 
     be->xhci->failed = true;
     be->xhci->doorbell_pending = false;
@@ -151,8 +169,7 @@ static void scope_xhci_fail(ScopeProxyState *s)
     be->intx_pending = false;
     if (!scope_xhci_set_pci_command(be, PCI_COMMAND_MEMORY |
                                       PCI_COMMAND_INTX_DISABLE)) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "SCOPE xhci: failed to disable physical bus master\n");
+        error_report("SCOPE xhci: failed to disable physical bus master");
     }
 }
 
@@ -330,7 +347,7 @@ static void scope_xhci_config_changed(ScopeProxyState *s, ScopeBackend *be,
         Error *err = NULL;
         if (!scope_xhci_halt(s, &err)) {
             error_report_err(err);
-            x->failed = true;
+            scope_xhci_fail(s, "physical controller did not halt");
         }
         x->doorbell_pending = false;
     }
@@ -338,9 +355,7 @@ static void scope_xhci_config_changed(ScopeProxyState *s, ScopeBackend *be,
         command &= ~PCI_COMMAND_MASTER;
     }
     if (!scope_xhci_set_pci_command(be, command)) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "SCOPE xhci: physical PCI command failed\n");
-        scope_xhci_fail(s);
+        scope_xhci_fail(s, "physical PCI command failed");
         command &= ~PCI_COMMAND_MASTER;
     }
     x->dma_ready = ready;
@@ -373,14 +388,23 @@ static void scope_xhci_process_bar_packet(
     bool ok = false;
 
     if (pkt->type == SCOPE_PKT_TYPE_BAR_WRITE_DONE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SCOPE xhci: DONE backend=%u seq=%u off=0x%x "
+                      "pending=%d expected_seq=%u expected_off=0x%x\n",
+                      s->active->id, pkt->seq, pkt->bar_offset,
+                      x->doorbell_pending, x->pending_doorbell.seq,
+                      x->pending_doorbell.bar_offset);
         if (x->doorbell_pending && pkt->seq == x->pending_doorbell.seq &&
             pkt->bar_offset == x->pending_doorbell.bar_offset) {
-            x->doorbell_pending = false;
             if (!x->dma_ready || !x->bus_master ||
                 !scope_xhci_commit_write(s, &x->pending_doorbell)) {
-                scope_xhci_fail(s);
+                scope_xhci_fail(s, "deferred physical doorbell failed");
+            } else {
+                x->doorbell_pending = false;
                 qemu_log_mask(LOG_GUEST_ERROR,
-                              "SCOPE xhci: deferred physical doorbell failed\n");
+                              "SCOPE xhci: doorbell committed backend=%u "
+                              "seq=%u off=0x%x\n",
+                              s->active->id, pkt->seq, pkt->bar_offset);
             }
         }
         return;
@@ -405,7 +429,15 @@ static void scope_xhci_process_bar_packet(
                     x->doorbell_pending = true;
                     x->doorbell_since_us = g_get_monotonic_time();
                     /* Same ordering handshake used by the local NVMe path. */
-                    scope_write_bar_response(s, pkt->seq, 0, 0, false, true);
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "SCOPE xhci: waiting for DONE backend=%u "
+                                  "seq=%u off=0x%x value=0x%x\n",
+                                  s->active->id, pkt->seq, pkt->bar_offset,
+                                  scope_extract_dword32(value, pkt->bar_offset));
+                    if (!scope_write_bar_response(s, pkt->seq, 0, 0,
+                                                  false, true)) {
+                        scope_xhci_fail(s, "doorbell acknowledgement failed");
+                    }
                     return;
                 }
             } else {
@@ -418,6 +450,12 @@ static void scope_xhci_process_bar_packet(
             ok = scope_real_bar_write(s, pkt->bar_offset, value, strobe, size);
         }
     }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "SCOPE xhci: BAR %s backend=%u seq=%u off=0x%x size=%u "
+                  "resp=%u data=0x%" PRIx64 " failed=%d\n",
+                  read ? "read" : "write", s->active->id, pkt->seq,
+                  pkt->bar_offset, size, ok ? 0 : 2,
+                  read ? data : value, x->failed);
     scope_write_bar_response(s, pkt->seq, ok ? 0 : 2,
                              read ? data : 0, read, false);
 }
@@ -430,18 +468,26 @@ static bool scope_xhci_poll(ScopeProxyState *s, int64_t now_us)
         &s->vcfg[SCOPE_VSWITCH_EP_SLOT(s->active->id)];
 
     if (x->doorbell_pending && now_us - x->doorbell_since_us > 1000000) {
-        scope_xhci_fail(s);
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "SCOPE xhci: timed out waiting for BAR_WRITE_DONE\n");
+        scope_xhci_fail(s, "timed out waiting for BAR_WRITE_DONE");
     }
 
+    /* A stopped xHC may retain EINT/IP during guest initialization.  Do not
+     * turn those into a virtual interrupt storm before the guest starts it.
+     * Hardware errors must still reach the driver even if the xHC halted
+     * itself and cleared RUN.  Leave event/interrupt status for guest ACKs.
+     */
     s->active->intx_pending = !x->failed && x->dma_ready && x->bus_master &&
         !(lduw_le_p(fn->config + PCI_COMMAND) & PCI_COMMAND_INTX_DISABLE) &&
         scope_real_bar_read32(s, x->operational, &command) &&
+        command != UINT32_MAX &&
         (command & SCOPE_XHCI_INTE) &&
         scope_real_bar_read32(s, x->operational + 4, &status) &&
+        status != UINT32_MAX &&
+        (((command & SCOPE_XHCI_RS) && !(status & SCOPE_XHCI_HCH)) ||
+         (status & (SCOPE_XHCI_HSE | SCOPE_XHCI_HCE))) &&
         (status & SCOPE_XHCI_EINT) &&
         scope_real_bar_read32(s, x->runtime + 0x20, &iman) &&
+        iman != UINT32_MAX &&
         ((iman & 3U) == 3U);
     return false;
 }
