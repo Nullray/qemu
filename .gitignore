@@ -1,6 +1,7 @@
 /GNUmakefile
 /build/
 /build.*/
+/build-xsai/
 /.cache/
 /.vscode/
 /.Xil/
@@ -43,3 +44,5 @@ GTAGS
 /subprojects/libvduse/linux-headers/linux/
 /subprojects/libvduse/standard-headers/linux/
 /subprojects/libvhost-user/standard-headers/linux/
+
+/build-kunminghu-scope/

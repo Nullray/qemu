@@ -3,7 +3,7 @@
  *
  * XiangShan sees an 8086:10fb PF and uses the standard ixgbe driver.  The
  * register and descriptor model lives here; Host B only sends and receives
- * complete Ethernet frames through the remote RDMA control connection.
+ * complete Ethernet frames through RDMA or a local host TAP interface.
  */
 
 #define SCOPE_IXGBE_REG_COUNT             (SCOPE_IXGBE_BAR0_SIZE / 4U)
@@ -424,7 +424,7 @@ static bool scope_ixgbe_tx_completion_timed_out(ScopeProxyState *s,
         (uint64_t)scope_remote_request_timeout_ms(s->active->remote) * 1000U;
     unsigned int i;
 
-    if (!timeout_us) {
+    if (s->active->transport == SCOPE_TRANSPORT_HOST_TAP || !timeout_us) {
         return false;
     }
     for (i = 0; i < ARRAY_SIZE(x->tx_completion); i++) {
@@ -519,9 +519,43 @@ static bool scope_ixgbe_process_tx(ScopeProxyState *s, uint16_t new_tail)
             }
 
             net_checksum_calculate(x->tx_frame, x->tx_frame_len, CSUM_ALL);
-            if (!scope_remote_submit_ixgbe_tx(s->active->remote,
-                                               x->tx_frame, x->tx_frame_len,
-                                               request_id, &local_err)) {
+            bool submitted;
+            if (s->active->transport == SCOPE_TRANSPORT_HOST_TAP) {
+                ssize_t written;
+                do {
+                    written = write(s->active->tap_fd, x->tx_frame,
+                                    x->tx_frame_len);
+                } while (written < 0 && errno == EINTR);
+                submitted = written == x->tx_frame_len;
+                if (submitted) {
+                    ScopeRemoteEvent event = {
+                        .type = SCOPE_REMOTE_EVENT_IXGBE_TX_COMPLETE,
+                        .request_id = request_id,
+                        .u.tx_complete.length = x->tx_frame_len,
+                    };
+                    /* Publish DD only after the host accepted this frame. */
+                    if (!scope_ixgbe_complete_tx(s, &event)) {
+                        s->active->remote_failed_state = true;
+                        x->link_up = false;
+                        scope_ixgbe_raise(s, SCOPE_IXGBE_EICR_LSC);
+                        return false;
+                    }
+                } else if (written >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+                    if (written >= 0) {
+                        errno = EIO;
+                    }
+                    s->active->remote_failed_state = true;
+                    x->link_up = false;
+                    scope_ixgbe_raise(s, SCOPE_IXGBE_EICR_LSC);
+                    error_setg_errno(&local_err, errno, "host TAP TX failed");
+                }
+            } else {
+                submitted = scope_remote_submit_ixgbe_tx(s->active->remote,
+                                                         x->tx_frame,
+                                                         x->tx_frame_len,
+                                                         request_id, &local_err);
+            }
+            if (!submitted) {
                 memset(completion, 0, sizeof(*completion));
                 x->tx_frame_len = frame_len_before;
                 x->tx_frame_wb_count = wb_count_before;
@@ -533,8 +567,8 @@ static bool scope_ixgbe_process_tx(ScopeProxyState *s, uint16_t new_tail)
             x->tx_submitted++;
             SCOPE_PRINTF("[SCOPE IXGBE][TX_SUBMIT] backend=%u request=%" PRIu64
                          " length=%u wb=%u submitted=%" PRIu64 "\n",
-                         s->active->id, request_id, completion->length,
-                         completion->wb_count, x->tx_submitted);
+                         s->active->id, request_id, x->tx_frame_len,
+                         x->tx_frame_wb_count, x->tx_submitted);
             x->tx_frame_len = 0;
             x->tx_frame_wb_count = 0;
         }
@@ -829,7 +863,40 @@ static bool scope_ixgbe_poll(ScopeProxyState *s, int64_t now_us)
     bool progressed = false;
     unsigned int events;
 
-    if (!x || !s->active->remote || s->active->remote_failed_state) {
+    if (!x || s->active->remote_failed_state) {
+        return false;
+    }
+    if (s->active->transport == SCOPE_TRANSPORT_HOST_TAP) {
+        uint8_t frame[SCOPE_IXGBE_MAX_FRAME];
+        ScopeVswitchConfigFn *fn = &s->vcfg[SCOPE_VSWITCH_EP_SLOT(s->active->id)];
+        if (!(lduw_le_p(fn->config + PCI_COMMAND) & PCI_COMMAND_MASTER)) {
+            return false;
+        }
+        for (events = 0; events < SCOPE_IXGBE_REMOTE_EVENT_BUDGET; events++) {
+            ssize_t length = read(s->active->tap_fd, frame, sizeof(frame));
+            if (length < 0 && errno == EINTR) {
+                continue;
+            }
+            if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            }
+            if (length <= 0) {
+                s->active->remote_failed_state = true;
+                x->link_up = false;
+                scope_ixgbe_raise(s, SCOPE_IXGBE_EICR_LSC);
+                break;
+            }
+            progressed = true;
+            scope_ixgbe_deliver_rx(s, frame, length);
+        }
+        if (!s->active->remote_failed_state) {
+            progressed |= scope_ixgbe_poll_pending(s, &x->tx_pending, true);
+            progressed |= scope_ixgbe_poll_pending(s, &x->rx_pending, false);
+        }
+        scope_ixgbe_update_intx(s);
+        return progressed;
+    }
+    if (!s->active->remote) {
         return false;
     }
     for (events = 0; events < SCOPE_IXGBE_REMOTE_EVENT_BUDGET; events++) {
@@ -944,6 +1011,19 @@ static void scope_ixgbe_process_bar_packet(
 
 static bool scope_ixgbe_backend_preflight(ScopeProxyState *s, Error **errp)
 {
+    if (s->active->transport == SCOPE_TRANSPORT_HOST_TAP) {
+        uint64_t offset;
+        if (!s->bypass_coherent_alias_base || s->guest_mem_raw_fallback) {
+            error_setg(errp, "host-net requires coherent guest memory without raw fallback");
+            return false;
+        }
+        if (!scope_guest_range_to_coherent_bar_offset(s, s->guest_ddr_base,
+                                                      s->guest_ddr_size, &offset)) {
+            error_setg(errp, "host-net coherent aperture does not cover guest RAM");
+            return false;
+        }
+        return true;
+    }
     if (s->active->transport != SCOPE_TRANSPORT_REMOTE_RDMA ||
         s->active->remote_memory_mode !=
             (s->active->remote_ixgbe_shadow_ring ?
@@ -974,6 +1054,38 @@ static bool scope_ixgbe_backend_realize(ScopeProxyState *s, Error **errp)
     struct scope_remote_device_info info = { 0 };
     ScopeIxgbeState *x;
 
+    if (be->transport == SCOPE_TRANSPORT_HOST_TAP) {
+        struct ifreq ifr = { 0 };
+        be->tap_fd = open("/dev/net/tun", O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (be->tap_fd < 0) {
+            error_setg_errno(errp, errno, "Failed to open /dev/net/tun");
+            return false;
+        }
+        ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+        pstrcpy(ifr.ifr_name, sizeof(ifr.ifr_name), be->tap_name);
+        if (ioctl(be->tap_fd, TUNSETIFF, &ifr) < 0) {
+            error_setg_errno(errp, errno, "Failed to attach host TAP %s", be->tap_name);
+            return false;
+        }
+        x = g_new0(ScopeIxgbeState, 1);
+        be->ixgbe = x;
+        x->mac[0] = 0x02;
+        x->mac[1] = 0x58;
+        x->mac[2] = 0x53;
+        x->mac[3] = 0x41;
+        x->mac[4] = 0x49;
+        x->mac[5] = be->id + 1;
+        x->mtu = 1500;
+        x->link_up = true;
+        x->next_tx_id = 1;
+        scope_ixgbe_init_virtual_eeprom(x);
+        be->real_bar0_size = SCOPE_IXGBE_BAR0_SIZE;
+        be->real_bar0_flags = IORESOURCE_MEM;
+        scope_ixgbe_reset_model(s);
+        SCOPE_PRINTF("[SCOPE HOST-NET][READY] TAP=%s virtual=8086:10fb "
+                     "queue=0 mtu=1500\n", be->tap_name);
+        return true;
+    }
     be->remote = scope_remote_connect(&config, &info, errp);
     if (!be->remote) {
         return false;
@@ -1000,6 +1112,10 @@ static bool scope_ixgbe_backend_realize(ScopeProxyState *s, Error **errp)
 
 static void scope_ixgbe_backend_cleanup(ScopeProxyState *s, ScopeBackend *be)
 {
+    if (be->tap_fd >= 0) {
+        close(be->tap_fd);
+        be->tap_fd = -1;
+    }
     scope_remote_disconnect(be->remote);
     be->remote = NULL;
     g_free(be->ixgbe);
