@@ -8,6 +8,8 @@ cc -shared -fPIC -Wall -Wextra -Werror -I"$qemu_root" -I"$qemu_root/include" \
   "$qemu_root/tests/scope-usb/fake-xdma.c" -ldl -o "$test_dir/fake-xdma.so"
 python3 "$qemu_root/tests/scope-usb/test-physical-xhci.py" \
   "$qemu_binary" "$test_dir/fake-xdma.so"
+python3 "$qemu_root/tests/scope-usb/test-lifecycle.py" \
+  "$qemu_binary" "$test_dir/fake-xdma.so"
 kernel_source=${SCOPE_GUEST_KERNEL:-$qemu_root/../work_farm/software/linux}
 mkdir -p "$test_dir/linux"
 touch "$test_dir/linux/dma-direct.h"

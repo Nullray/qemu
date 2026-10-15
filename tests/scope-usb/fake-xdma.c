@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #define _LARGEFILE64_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -69,8 +70,36 @@ int ioctl(int fd, unsigned long request, ...)
     if (len > 0) {
         path[len] = 0;
         if (ctrl && !strcmp(path, ctrl)) {
-            if (request == XDMA_IOC_DMA32_DB_FREE) return 0;
+            const char *mode = getenv("SCOPE_TEST_RING_MODE");
+            const char *trace = getenv("SCOPE_TEST_IOCTL_LOG");
+            if (request == XDMA_IOC_DMA32_DB_FREE) {
+                if (trace) {
+                    FILE *log = fopen(trace, "a");
+                    if (log) {
+                        fprintf(log, "FREE\n");
+                        fclose(log);
+                    }
+                }
+                return 0;
+            }
+            if (request == XDMA_IOC_DMA32_DB_QUERY) {
+                if (mode && !strcmp(mode, "stale")) {
+                    va_start(ap, request);
+                    struct scope_xdma_dma32_doorbell *db = va_arg(ap, void *);
+                    va_end(ap);
+                    db->size = 65536;
+                    db->dma_addr = 0x40000000;
+                    return 0;
+                }
+                errno = ENODATA;
+                return -1;
+            }
             if (request == XDMA_IOC_DMA32_DB_ALLOC) {
+                if (mode && (!strcmp(mode, "busy") ||
+                             !strcmp(mode, "stale"))) {
+                    errno = EBUSY;
+                    return -1;
+                }
                 va_start(ap, request);
                 struct scope_xdma_dma32_doorbell *db = va_arg(ap, void *);
                 va_end(ap);

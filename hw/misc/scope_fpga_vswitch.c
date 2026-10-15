@@ -8,6 +8,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
+#include "system/system.h"
 #include "block/nvme.h"
 #include "hw/net/igb_regs.h"
 #include "net/checksum.h"
@@ -18,6 +19,7 @@
 #include "hw/misc/scope_vortex_gids_queue.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -491,6 +493,9 @@ struct ScopeProxyState {
     void *dma32_db_map;
     void *ecam_shadow_map;
     struct scope_xdma_dma32_doorbell dma32_db;
+    bool dma32_db_owned;
+    Notifier exit_notifier;
+    bool exit_notifier_registered;
 
     QemuMutex xdma_lock;
     bool xdma_lock_inited;
@@ -6851,25 +6856,27 @@ static void *scope_proxy_rx_thread(void *opaque)
 static bool scope_alloc_dma32_ring(ScopeProxyState *s, Error **errp)
 {
     off_t mmap_offset;
+    struct scope_xdma_dma32_doorbell request = { 0 };
 
     if (s->dma32_ring_size < 0x1000 || s->dma32_ring_size > 0x400000 ||
         (s->dma32_ring_size & 0xfff)) {
         error_setg(errp, "dma32-ring-size must be page aligned and in [4KiB, 4MiB]");
         return false;
     }
-    s->dma32_db.size = s->dma32_ring_size;
-    if (ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_ALLOC, &s->dma32_db) < 0) {
+    request.size = s->dma32_ring_size;
+    if (ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_ALLOC, &request) < 0) {
         error_setg_errno(errp, errno, "XDMA_IOC_DMA32_DB_ALLOC failed");
         return false;
     }
+    /* FREE is device-wide, so failed ALLOC must never confer ownership. */
+    s->dma32_db = request;
+    s->dma32_db_owned = true;
 
     mmap_offset = (off_t)XDMA_DMA32_DB_MMAP_PGOFF * (off_t)s->host_page_size;
     s->dma32_db_map = mmap(NULL, s->dma32_db.size, PROT_READ | PROT_WRITE,
                            MAP_SHARED, s->xdma_ctrl_fd, mmap_offset);
     if (s->dma32_db_map == MAP_FAILED) {
         s->dma32_db_map = NULL;
-        ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_FREE);
-        memset(&s->dma32_db, 0, sizeof(s->dma32_db));
         error_setg_errno(errp, errno, "Failed to mmap DMA32 ring buffer");
         return false;
     }
@@ -7140,6 +7147,10 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
 {
     unsigned int i;
 
+    if (s->exit_notifier_registered) {
+        qemu_remove_exit_notifier(&s->exit_notifier);
+        s->exit_notifier_registered = false;
+    }
     if (s->rx_thread_started) {
         qatomic_set(&s->rx_thread_stop, 1);
         qemu_thread_join(&s->rx_thread);
@@ -7168,6 +7179,18 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
         scope_gds_clear_restore_pages(&s->gds);
     }
 
+    /* Stop physical producers before releasing the XDMA receive transport. */
+    if (s->backends) {
+        for (i = 0; i < SCOPE_VSWITCH_MAX_BACKENDS; i++) {
+            ScopeBackend *be = &s->backends[i];
+
+            if (be->ops && be->ops->cleanup) {
+                be->ops->cleanup(s, be);
+            }
+            scope_restore_real_pci_command(be);
+        }
+    }
+
     if (s->dma32_db_map) {
         munmap(s->dma32_db_map, s->dma32_db.size);
         s->dma32_db_map = NULL;
@@ -7176,18 +7199,18 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
         munmap(s->ecam_shadow_map, HOST_ECAM_SHADOW_SIZE);
         s->ecam_shadow_map = NULL;
     }
-    if (s->xdma_ctrl_fd >= 0 && s->dma32_db.size) {
-        ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_FREE);
+    if (s->xdma_ctrl_fd >= 0 && s->dma32_db_owned) {
+        if (ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_FREE) < 0) {
+            error_report("SCOPE: failed to release owned DMA32 ring: %s",
+                         strerror(errno));
+        }
+        s->dma32_db_owned = false;
         memset(&s->dma32_db, 0, sizeof(s->dma32_db));
     }
 
     if (s->backends) {
         for (i = 0; i < SCOPE_VSWITCH_MAX_BACKENDS; i++) {
             ScopeBackend *be = &s->backends[i];
-            if (be->ops && be->ops->cleanup) {
-                be->ops->cleanup(s, be);
-            }
-            scope_restore_real_pci_command(be);
             if (be->real_bar0_map) munmap(be->real_bar0_map, be->real_bar0_size);
             if (be->real_bar_fd >= 0) close(be->real_bar_fd);
             g_free(be->pending_admin_ops);
@@ -7227,6 +7250,13 @@ static void scope_proxy_cleanup(ScopeProxyState *s)
     s->backends = NULL;
     s->active = NULL;
     s->backend_count = 0;
+}
+
+static void scope_proxy_process_exit(Notifier *notifier, void *data)
+{
+    ScopeProxyState *s = container_of(notifier, ScopeProxyState, exit_notifier);
+
+    scope_proxy_cleanup(s);
 }
 
 static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
@@ -7280,6 +7310,32 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
     s->xdma_lock_inited = true;
     qemu_mutex_init(&s->state_lock);
     s->state_lock_inited = true;
+    /* Claim the transport before touching any physical backend. The kernel
+     * ring is device-wide and survives SIGKILL with the current XDMA driver.
+     */
+    s->xdma_ctrl_fd = open(xdma_ctrl_dev, O_RDWR);
+    if (s->xdma_ctrl_fd < 0) {
+        error_setg_errno(errp, errno, "Failed to open %s", xdma_ctrl_dev);
+        goto fail;
+    }
+    if (flock(s->xdma_ctrl_fd, LOCK_EX | LOCK_NB) < 0) {
+        error_setg_errno(errp, errno, "XDMA control is owned by another proxy");
+        goto fail;
+    }
+    {
+        struct scope_xdma_dma32_doorbell existing = { 0 };
+
+        if (ioctl(s->xdma_ctrl_fd, XDMA_IOC_DMA32_DB_QUERY, &existing) == 0) {
+            error_setg(errp, "XDMA DMA32 ring is still allocated; stop the "
+                       "previous session and verify DMA is stopped before "
+                       "explicit recovery (no automatic FREE)");
+            goto fail;
+        }
+        if (errno != ENODATA) {
+            error_setg_errno(errp, errno, "XDMA_IOC_DMA32_DB_QUERY failed");
+            goto fail;
+        }
+    }
     if (!scope_parse_fpga_bypass_bar(s, errp)) {
         goto fail;
     }
@@ -7339,12 +7395,6 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
         s->ecam_shadow_map = NULL;
         error_setg_errno(errp, errno,
                          "Failed to mmap FPGA ECAM shadow aperture");
-        goto fail;
-    }
-
-    s->xdma_ctrl_fd = open(xdma_ctrl_dev, O_RDWR);
-    if (s->xdma_ctrl_fd < 0) {
-        error_setg_errno(errp, errno, "Failed to open %s", xdma_ctrl_dev);
         goto fail;
     }
 
@@ -7450,6 +7500,9 @@ static void scope_proxy_realize(PCIDevice *pci_dev, Error **errp)
                s->xdma_event_dev);
     }
     SCOPE_PRINTF("[SCOPE PROXY] DMA32 CFG/BAR RX thread started.\n\n");
+    s->exit_notifier.notify = scope_proxy_process_exit;
+    qemu_add_exit_notifier(&s->exit_notifier);
+    s->exit_notifier_registered = true;
     return;
 
 fail:
